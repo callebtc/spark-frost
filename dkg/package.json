@@ -1,0 +1,28 @@
+{
+  "name": "spark-frost-dkg",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolated DKG demos for spark-frost",
+  "license": "Apache-2.0",
+  "scripts": {
+    "keygen": "node run-python.mjs chilldkg_keygen.py --threshold 2 --participants 3 --output state/chilldkg-2of3.json",
+    "spark-smoke": "tsx spark-smoke.ts",
+    "ceremony": "tsx ceremony.ts",
+    "test": "tsx no-mnemonic-signer.test.ts",
+    "types": "tsc"
+  },
+  "dependencies": {
+    "@buildonspark/spark-sdk": "workspace:*",
+    "@noble/curves": "^1.9.7",
+    "@noble/hashes": "^1.7.0",
+    "tsx": "^4.19.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.2",
+    "typescript": "^5.7.3"
+  },
+  "engines": {
+    "node": ">=20.19.0"
+  }
+}

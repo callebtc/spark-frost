@@ -13,10 +13,14 @@ dist/
 !.yarn/releases/**
 !.yarn/plugins/
 !.yarn/plugins/**
+__pycache__/
+*.py[cod]
 
 # Local wallet/demo state
 private/
 demo/state/
+dkg/state/
+dkg/output/
 *.log
 
 # Local upstream checkout used while extracting this fork.

@@ -9364,6 +9364,19 @@ __metadata:
   languageName: unknown
   linkType: soft
 
+"spark-frost-dkg@workspace:dkg":
+  version: 0.0.0-use.local
+  resolution: "spark-frost-dkg@workspace:dkg"
+  dependencies:
+    "@buildonspark/spark-sdk": "workspace:*"
+    "@noble/curves": "npm:^1.9.7"
+    "@noble/hashes": "npm:^1.7.0"
+    "@types/node": "npm:^22.13.2"
+    tsx: "npm:^4.19.3"
+    typescript: "npm:^5.7.3"
+  languageName: unknown
+  linkType: soft
+
 "spark-frost@workspace:.":
   version: 0.0.0-use.local
   resolution: "spark-frost@workspace:."
