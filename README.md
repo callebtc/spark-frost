@@ -90,7 +90,79 @@ The DKG demo lives under `dkg/` so it does not pollute the SDK package. We evalu
 
 You need Python `>=3.11` for the Blockstream reference. If your system `python3` is older, set `PYTHON=/path/to/python3.11`.
 
-Generate a fresh 2-of-3 DKG artifact:
+The most educational path is the staged ceremony CLI. It writes a public group file and one keyshare text file per participant, then uses those files in a proposal/sign/execute flow.
+
+Create keyshares for a 3-of-5 wallet:
+
+```sh
+PYTHON=/path/to/python3.11 yarn dkg:ceremony keygen --threshold 3 --participants 5 --out output/3-of-5
+```
+
+This writes:
+
+- `dkg/output/3-of-5/group.txt`
+- `dkg/output/3-of-5/participant-1-share.txt`
+- `dkg/output/3-of-5/participant-2-share.txt`
+- `dkg/output/3-of-5/participant-3-share.txt`
+- `dkg/output/3-of-5/participant-4-share.txt`
+- `dkg/output/3-of-5/participant-5-share.txt`
+
+The output directory is ignored because the participant files contain demo secret shares.
+
+Have the coordinator propose a Spark transfer:
+
+```sh
+NETWORK=REGTEST yarn dkg:ceremony propose \
+  --group output/3-of-5/group.txt \
+  --proposal output/3-of-5/proposal-transfer.json \
+  --kind transfer \
+  --amount 1000
+```
+
+Or propose a Lightning payment:
+
+```sh
+NETWORK=REGTEST yarn dkg:ceremony propose \
+  --group output/3-of-5/group.txt \
+  --proposal output/3-of-5/proposal-lightning.json \
+  --kind lightning \
+  --amount 100
+```
+
+The proposal step uses only `group.txt`. It creates a DKG-controlled Spark wallet, a receiver wallet if needed, and prints the `bcrt1...` deposit address to fund.
+
+Add participant signature shares one by one:
+
+```sh
+yarn dkg:ceremony sign --proposal output/3-of-5/proposal-transfer.json --share output/3-of-5/participant-1-share.txt
+yarn dkg:ceremony sign --proposal output/3-of-5/proposal-transfer.json --share output/3-of-5/participant-3-share.txt
+yarn dkg:ceremony sign --proposal output/3-of-5/proposal-transfer.json --share output/3-of-5/participant-5-share.txt
+```
+
+When the threshold is reached, the coordinator aggregates an authorization signature over the proposal. The final Spark transaction or Lightning payment is signed during execution, when the Spark SDK creates the real signing transcript.
+
+Execute after funding the printed `bcrt1...` address at the [Lightspark REGTEST faucet](https://app.lightspark.com/regtest-faucet):
+
+```sh
+NETWORK=REGTEST yarn dkg:ceremony execute \
+  --proposal output/3-of-5/proposal-transfer.json \
+  --faucet-txid "<faucet-txid>"
+```
+
+For a guided single command walkthrough:
+
+```sh
+PYTHON=/path/to/python3.11 NETWORK=REGTEST yarn dkg:ceremony walkthrough \
+  --threshold 2 \
+  --participants 3 \
+  --out output/walkthrough \
+  --kind transfer \
+  --amount 1000
+```
+
+Add `--yes` to skip the interactive pauses. Add `--faucet-txid <txid>` if the generated deposit address has already been funded.
+
+The older compact DKG commands are still useful for smoke testing. Generate a fresh 2-of-3 DKG artifact:
 
 ```sh
 PYTHON=/path/to/python3.11 yarn dkg:keygen
@@ -110,7 +182,7 @@ Initialize a REGTEST Spark wallet using that DKG-backed leaf key:
 NETWORK=REGTEST yarn dkg:spark-smoke
 ```
 
-Run the fundable DKG pipeline:
+Run the compact fundable DKG pipeline:
 
 ```sh
 NETWORK=REGTEST yarn dkg:pipeline

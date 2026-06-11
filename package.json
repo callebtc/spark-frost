@@ -26,6 +26,7 @@
     "dkg:keygen": "yarn workspace spark-frost-dkg keygen",
     "dkg:spark-smoke": "yarn workspace spark-frost-dkg spark-smoke",
     "dkg:pipeline": "yarn workspace spark-frost-dkg pipeline",
+    "dkg:ceremony": "yarn workspace spark-frost-dkg ceremony",
     "wallet:address": "yarn workspace @buildonspark/nodejs-scripts get-spark-address",
     "wallet:balance": "yarn workspace @buildonspark/nodejs-scripts get-balance"
   },

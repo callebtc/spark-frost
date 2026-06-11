@@ -9,6 +9,7 @@
     "keygen": "node run-python.mjs chilldkg_keygen.py --threshold 2 --participants 3 --output state/chilldkg-2of3.json",
     "spark-smoke": "tsx spark-smoke.ts",
     "pipeline": "tsx pipeline.ts",
+    "ceremony": "tsx ceremony.ts",
     "types": "tsc"
   },
   "dependencies": {

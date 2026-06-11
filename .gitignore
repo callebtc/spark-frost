@@ -20,6 +20,7 @@ __pycache__/
 private/
 demo/state/
 dkg/state/
+dkg/output/
 *.log
 
 # Local upstream checkout used while extracting this fork.

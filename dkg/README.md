@@ -6,8 +6,89 @@ The DKG implementation is vendored from
 `BlockstreamResearch/bip-frost-dkg`, which specifies ChillDKG for secp256k1
 FROST. That curve family matches Spark's Bitcoin/Schnorr leaf-signing needs.
 
-Generated artifacts are written under `dkg/state/`, which is ignored because it
-contains demo host secrets and participant secret shares.
+Generated artifacts are written under `dkg/state/` or `dkg/output/`, which are
+ignored because they contain demo host secrets and participant secret shares.
+
+## Staged Ceremony CLI
+
+The most educational demo is `yarn dkg:ceremony`. It separates the flow into
+three stages:
+
+1. Create distributed keyshares.
+2. Propose a Spark transfer or Lightning payment and collect participant
+   signature shares one by one.
+3. Execute the funded Spark action using the collected threshold shares.
+
+Create keyshares for a 3-of-5 wallet:
+
+```sh
+PYTHON=/path/to/python3.11 yarn dkg:ceremony keygen --threshold 3 --participants 5 --out output/3-of-5
+```
+
+This writes a public coordinator file plus one private text file per
+participant:
+
+- `output/3-of-5/group.txt`
+- `output/3-of-5/participant-1-share.txt`
+- `output/3-of-5/participant-2-share.txt`
+- `output/3-of-5/participant-3-share.txt`
+- `output/3-of-5/participant-4-share.txt`
+- `output/3-of-5/participant-5-share.txt`
+
+Propose a Spark transfer:
+
+```sh
+NETWORK=REGTEST yarn dkg:ceremony propose \
+  --group output/3-of-5/group.txt \
+  --proposal output/3-of-5/proposal-transfer.json \
+  --kind transfer \
+  --amount 1000
+```
+
+Or propose a Lightning payment:
+
+```sh
+NETWORK=REGTEST yarn dkg:ceremony propose \
+  --group output/3-of-5/group.txt \
+  --proposal output/3-of-5/proposal-lightning.json \
+  --kind lightning \
+  --amount 100
+```
+
+The proposal step uses only the public `group.txt`. It prints the DKG-controlled
+Spark address and the `bcrt1...` Bitcoin deposit address to fund.
+
+Add participants one by one:
+
+```sh
+yarn dkg:ceremony sign --proposal output/3-of-5/proposal-transfer.json --share output/3-of-5/participant-1-share.txt
+yarn dkg:ceremony sign --proposal output/3-of-5/proposal-transfer.json --share output/3-of-5/participant-3-share.txt
+yarn dkg:ceremony sign --proposal output/3-of-5/proposal-transfer.json --share output/3-of-5/participant-5-share.txt
+```
+
+When the threshold is reached, the coordinator aggregates an authorization
+signature over the proposal. The actual Spark transaction or Lightning payment
+is signed during execution because Spark creates the final signing transcript at
+that point.
+
+After funding the printed deposit address at the REGTEST faucet, execute:
+
+```sh
+NETWORK=REGTEST yarn dkg:ceremony execute \
+  --proposal output/3-of-5/proposal-transfer.json \
+  --faucet-txid "<faucet-txid>"
+```
+
+For a guided one-command walkthrough:
+
+```sh
+PYTHON=/path/to/python3.11 NETWORK=REGTEST yarn dkg:ceremony walkthrough \
+  --threshold 2 \
+  --participants 3 \
+  --out output/walkthrough \
+  --kind transfer \
+  --amount 1000
+```
 
 ## Run ChillDKG
 

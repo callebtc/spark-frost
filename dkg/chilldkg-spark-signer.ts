@@ -21,6 +21,7 @@ import {
 } from "@buildonspark/spark-sdk";
 
 export type ChillDkgArtifact = {
+  paramsIdHex?: string;
   threshold: number;
   participants: number;
   participantIndexBase: number;
@@ -34,6 +35,31 @@ export type ChillDkgArtifact = {
   }>;
 };
 
+export type ChillDkgGroupFile = {
+  kind: "spark-frost-chilldkg-group";
+  version: number;
+  threshold: number;
+  participants: number;
+  participantIndexBase: number;
+  paramsIdHex: string;
+  coordinator: {
+    thresholdPubkeyHex: string;
+  };
+};
+
+export type ChillDkgKeyshareFile = {
+  kind: "spark-frost-chilldkg-keyshare";
+  version: number;
+  threshold: number;
+  participants: number;
+  participantIndexBase: number;
+  paramsIdHex: string;
+  index: number;
+  secshareHex: string;
+  thresholdPubkeyHex: string;
+  pubshareHexes: string[];
+};
+
 export type DkgShare = {
   index: number;
   value: bigint;
@@ -45,6 +71,28 @@ type ThresholdNonceState = {
 
 const ONE = numberToBytesBE(1n, 32);
 const TWO = numberToBytesBE(2n, 32);
+
+export class PublicOnlyChillDkgSparkSigner extends DefaultSparkSigner {
+  constructor(private readonly publicKey: Uint8Array) {
+    super();
+  }
+
+  override async getPublicKeyFromDerivation(
+    keyDerivation: KeyDerivation,
+  ): Promise<Uint8Array> {
+    if (keyDerivation?.type === KeyDerivationType.LEAF) {
+      return this.publicKey;
+    }
+    return super.getPublicKeyFromDerivation(keyDerivation);
+  }
+
+  override async signFrost(params: SignFrostParams): Promise<Uint8Array> {
+    if (params.keyDerivation.type === KeyDerivationType.LEAF) {
+      throw new Error("public-only DKG signer cannot sign Spark leaf messages");
+    }
+    return super.signFrost(params);
+  }
+}
 
 export class ChillDkgSparkSigner extends DefaultSparkSigner {
   private readonly publicKey: Uint8Array;
@@ -167,6 +215,88 @@ export function loadArtifact(
   ) as ChillDkgArtifact;
 }
 
+export function loadGroupFile(groupPath: string): ChillDkgGroupFile {
+  const group = JSON.parse(
+    fs.readFileSync(path.resolve(process.cwd(), groupPath), "utf8"),
+  ) as ChillDkgGroupFile;
+  if (group.kind !== "spark-frost-chilldkg-group") {
+    throw new Error(`Not a spark-frost DKG group file: ${groupPath}`);
+  }
+  return group;
+}
+
+export function loadKeyshareFile(sharePath: string): ChillDkgKeyshareFile {
+  const share = JSON.parse(
+    fs.readFileSync(path.resolve(process.cwd(), sharePath), "utf8"),
+  ) as ChillDkgKeyshareFile;
+  if (share.kind !== "spark-frost-chilldkg-keyshare") {
+    throw new Error(`Not a spark-frost DKG keyshare file: ${sharePath}`);
+  }
+  return share;
+}
+
+export function artifactFromSplitFiles(
+  groupPath: string,
+  sharePaths: string[],
+): ChillDkgArtifact {
+  const group = loadGroupFile(groupPath);
+  const shares = sharePaths.map((sharePath) => loadKeyshareFile(sharePath));
+  for (const share of shares) {
+    if (share.paramsIdHex !== group.paramsIdHex) {
+      throw new Error(
+        `Keyshare ${share.index} belongs to another DKG session`,
+      );
+    }
+    if (share.thresholdPubkeyHex !== group.coordinator.thresholdPubkeyHex) {
+      throw new Error(
+        `Keyshare ${share.index} has a different threshold public key`,
+      );
+    }
+    if (
+      share.threshold !== group.threshold ||
+      share.participants !== group.participants ||
+      share.participantIndexBase !== group.participantIndexBase
+    ) {
+      throw new Error(`Keyshare ${share.index} has mismatched DKG parameters`);
+    }
+  }
+  return {
+    paramsIdHex: group.paramsIdHex,
+    threshold: group.threshold,
+    participants: group.participants,
+    participantIndexBase: group.participantIndexBase,
+    coordinator: group.coordinator,
+    participantsOutput: shares.map((share) => ({
+      index: share.index,
+      secshareHex: share.secshareHex,
+      pubshareHexes: share.pubshareHexes,
+    })),
+  };
+}
+
+export function publicKeyFromGroupFile(groupPath: string): Uint8Array {
+  return normalizeSparkPublicKey(
+    hexToBytes(loadGroupFile(groupPath).coordinator.thresholdPubkeyHex),
+  );
+}
+
+export function createPublicOnlyChillDkgSparkSigner(
+  groupPath: string,
+): PublicOnlyChillDkgSparkSigner {
+  return new PublicOnlyChillDkgSparkSigner(publicKeyFromGroupFile(groupPath));
+}
+
+export function createChillDkgSparkSignerFromShareFiles(
+  groupPath: string,
+  sharePaths: string[],
+): ReturnType<typeof createChillDkgSparkSigner> {
+  const artifact = artifactFromSplitFiles(groupPath, sharePaths);
+  return createChillDkgSparkSigner(
+    artifact,
+    artifact.participantsOutput.map((participant) => participant.index),
+  );
+}
+
 export function createChillDkgSparkSigner(
   artifact = loadArtifact(),
   selected = selectedSignerIndexes(),
@@ -227,6 +357,14 @@ export function selectedSignerIndexes(): number[] {
     .split(",")
     .filter(Boolean)
     .map((value) => Number.parseInt(value, 10));
+}
+
+export function normalizeSparkPublicKey(publicKey: Uint8Array): Uint8Array {
+  const normalized = new Uint8Array(publicKey);
+  if (normalized[0] === 3) {
+    normalized[0] = 2;
+  }
+  return normalized;
 }
 
 function selectedShares(

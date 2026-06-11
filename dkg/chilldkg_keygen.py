@@ -142,6 +142,59 @@ def run_chilldkg(threshold: int, participants: int) -> dict[str, Any]:
     }
 
 
+def write_split_keyshare_files(artifact: dict[str, Any], output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    group = {
+        "kind": "spark-frost-chilldkg-group",
+        "version": 1,
+        "implementation": artifact["implementation"],
+        "protocol": artifact["protocol"],
+        "curve": artifact["curve"],
+        "threshold": artifact["threshold"],
+        "participants": artifact["participants"],
+        "participantIndexBase": artifact["participantIndexBase"],
+        "paramsIdHex": artifact["paramsIdHex"],
+        "hostPubkeyHexes": artifact["hostPubkeyHexes"],
+        "coordinator": artifact["coordinator"],
+        "recoveryDataHex": artifact["recoveryDataHex"],
+        "notes": [
+            "Public coordinator metadata for the spark-frost DKG demo.",
+            "This file is safe to share with the signing coordinator.",
+            "Participant secret shares live in participant-*-share.txt files.",
+        ],
+    }
+    (output_dir / "group.txt").write_text(
+        json.dumps(group, indent=2) + "\n",
+        encoding="utf8",
+    )
+
+    for participant in artifact["participantsOutput"]:
+        share = {
+            "kind": "spark-frost-chilldkg-keyshare",
+            "version": 1,
+            "implementation": artifact["implementation"],
+            "protocol": artifact["protocol"],
+            "curve": artifact["curve"],
+            "threshold": artifact["threshold"],
+            "participants": artifact["participants"],
+            "participantIndexBase": artifact["participantIndexBase"],
+            "paramsIdHex": artifact["paramsIdHex"],
+            "index": participant["index"],
+            "secshareHex": participant["secshareHex"],
+            "thresholdPubkeyHex": artifact["coordinator"]["thresholdPubkeyHex"],
+            "pubshareHexes": participant["pubshareHexes"],
+            "notes": [
+                "Demo participant key share. Keep this file private.",
+                "A real wallet would store this on a separate signer device.",
+            ],
+        }
+        filename = f"participant-{participant['index']}-share.txt"
+        (output_dir / filename).write_text(
+            json.dumps(share, indent=2) + "\n",
+            encoding="utf8",
+        )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run a local ChillDKG demo")
     parser.add_argument("--threshold", "-t", type=int, default=2)
@@ -151,6 +204,10 @@ def main() -> int:
         "-o",
         default="state/chilldkg-2of3.json",
         help="Output JSON path, relative to dkg/ by default",
+    )
+    parser.add_argument(
+        "--output-dir",
+        help="Directory for split group/keyshare text files, relative to dkg/ by default",
     )
     args = parser.parse_args()
 
@@ -162,6 +219,12 @@ def main() -> int:
     output_path.write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf8")
 
     print(f"wrote {output_path}")
+    if args.output_dir:
+        output_dir = Path(args.output_dir)
+        if not output_dir.is_absolute():
+            output_dir = ROOT / output_dir
+        write_split_keyshare_files(artifact, output_dir)
+        print(f"wrote split keyshare files in {output_dir}")
     print(f"threshold public key: {artifact['coordinator']['thresholdPubkeyHex']}")
     print(f"params id: {artifact['paramsIdHex']}")
     return 0
