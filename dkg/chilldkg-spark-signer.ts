@@ -1,13 +1,16 @@
 import fs from "node:fs";
 import path from "node:path";
 import { mod } from "@noble/curves/abstract/modular";
-import { secp256k1 } from "@noble/curves/secp256k1";
+import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
 import {
   bytesToHex,
   bytesToNumberBE,
   hexToBytes,
   numberToBytesBE,
 } from "@noble/curves/utils";
+import { hmac } from "@noble/hashes/hmac";
+import { sha256 } from "@noble/hashes/sha2";
+import type { Transaction } from "@scure/btc-signer";
 import {
   DefaultSparkSigner,
   getSigningCommitmentFromNonce,
@@ -60,6 +63,15 @@ export type ChillDkgKeyshareFile = {
   pubshareHexes: string[];
 };
 
+export type CoordinatorKeyFile = {
+  kind: "spark-frost-coordinator-keys";
+  version: number;
+  identityPrivateKeyHex: string;
+  depositPrivateKeyHex: string;
+  staticDepositPrivateKeyHex: string;
+  htlcPreimagePrivateKeyHex: string;
+};
+
 export type DkgShare = {
   index: number;
   value: bigint;
@@ -73,15 +85,67 @@ const ONE = numberToBytesBE(1n, 32);
 const TWO = numberToBytesBE(2n, 32);
 
 export class PublicOnlyChillDkgSparkSigner extends DefaultSparkSigner {
-  constructor(private readonly publicKey: Uint8Array) {
+  private readonly identityPrivateKey?: Uint8Array;
+
+  constructor(
+    private readonly publicKey: Uint8Array,
+    coordinatorKeys?: CoordinatorKeyFile,
+  ) {
     super();
+    this.identityPrivateKey = coordinatorKeys
+      ? hexToBytes(coordinatorKeys.identityPrivateKeyHex)
+      : undefined;
+  }
+
+  override createSparkWalletFromSeed(
+    _seed: Uint8Array | string,
+    _accountNumber?: number,
+  ): Promise<string> {
+    throw new Error(
+      "PublicOnlyChillDkgSparkSigner uses pre-existing keys; initialize with signerWithPreExistingKeys",
+    );
+  }
+
+  override generateMnemonic(): Promise<string> {
+    throw new Error("PublicOnlyChillDkgSparkSigner does not generate mnemonics");
+  }
+
+  override mnemonicToSeed(_mnemonic: string): Promise<Uint8Array> {
+    throw new Error("PublicOnlyChillDkgSparkSigner does not use mnemonics");
+  }
+
+  override getIdentityPublicKey(): Promise<Uint8Array> {
+    if (!this.identityPrivateKey) {
+      return super.getIdentityPublicKey();
+    }
+    return Promise.resolve(secp256k1.getPublicKey(this.identityPrivateKey));
+  }
+
+  override signMessageWithIdentityKey(
+    message: Uint8Array,
+    compact?: boolean,
+  ): Promise<Uint8Array> {
+    if (!this.identityPrivateKey) {
+      return super.signMessageWithIdentityKey(message, compact);
+    }
+    const signature = secp256k1.sign(message, this.identityPrivateKey);
+    return Promise.resolve(
+      compact ? signature.toCompactRawBytes() : signature.toDERRawBytes(),
+    );
+  }
+
+  override signSchnorrWithIdentityKey(message: Uint8Array): Promise<Uint8Array> {
+    if (!this.identityPrivateKey) {
+      return super.signSchnorrWithIdentityKey(message);
+    }
+    return Promise.resolve(schnorr.sign(message, this.identityPrivateKey));
   }
 
   override async getPublicKeyFromDerivation(
     keyDerivation: KeyDerivation,
   ): Promise<Uint8Array> {
     if (keyDerivation?.type === KeyDerivationType.LEAF) {
-      return this.publicKey;
+      return deriveDkgLeafPublicKey(this.publicKey, keyDerivation.path);
     }
     return super.getPublicKeyFromDerivation(keyDerivation);
   }
@@ -97,6 +161,10 @@ export class PublicOnlyChillDkgSparkSigner extends DefaultSparkSigner {
 export class ChillDkgSparkSigner extends DefaultSparkSigner {
   private readonly publicKey: Uint8Array;
   private readonly shares: DkgShare[];
+  private readonly identityPrivateKey?: Uint8Array;
+  private readonly depositPrivateKey?: Uint8Array;
+  private readonly staticDepositPrivateKey?: Uint8Array;
+  private readonly htlcPreimagePrivateKey?: Uint8Array;
   private readonly thresholdNonceStates = new Map<
     string,
     ThresholdNonceState
@@ -105,22 +173,162 @@ export class ChillDkgSparkSigner extends DefaultSparkSigner {
   constructor({
     publicKey,
     shares,
+    coordinatorKeys,
   }: {
     publicKey: Uint8Array;
     shares: DkgShare[];
+    coordinatorKeys?: CoordinatorKeyFile;
   }) {
     super();
     this.publicKey = publicKey;
     this.shares = shares;
+    this.identityPrivateKey = coordinatorKeys
+      ? hexToBytes(coordinatorKeys.identityPrivateKeyHex)
+      : undefined;
+    this.depositPrivateKey = coordinatorKeys
+      ? hexToBytes(coordinatorKeys.depositPrivateKeyHex)
+      : undefined;
+    this.staticDepositPrivateKey = coordinatorKeys
+      ? hexToBytes(coordinatorKeys.staticDepositPrivateKeyHex)
+      : undefined;
+    this.htlcPreimagePrivateKey = coordinatorKeys
+      ? hexToBytes(coordinatorKeys.htlcPreimagePrivateKeyHex)
+      : undefined;
+  }
+
+  override createSparkWalletFromSeed(
+    _seed: Uint8Array | string,
+    _accountNumber?: number,
+  ): Promise<string> {
+    throw new Error(
+      "ChillDkgSparkSigner uses pre-existing keys; initialize with signerWithPreExistingKeys",
+    );
+  }
+
+  override generateMnemonic(): Promise<string> {
+    throw new Error("ChillDkgSparkSigner does not generate mnemonics");
+  }
+
+  override mnemonicToSeed(_mnemonic: string): Promise<Uint8Array> {
+    throw new Error("ChillDkgSparkSigner does not use mnemonics");
+  }
+
+  override getIdentityPublicKey(): Promise<Uint8Array> {
+    if (!this.identityPrivateKey) {
+      return super.getIdentityPublicKey();
+    }
+    return Promise.resolve(secp256k1.getPublicKey(this.identityPrivateKey));
+  }
+
+  override getDepositSigningKey(): Promise<Uint8Array> {
+    if (!this.depositPrivateKey) {
+      return super.getDepositSigningKey();
+    }
+    return Promise.resolve(secp256k1.getPublicKey(this.depositPrivateKey));
+  }
+
+  override async getStaticDepositSigningKey(idx: number): Promise<Uint8Array> {
+    if (!this.staticDepositPrivateKey) {
+      return super.getStaticDepositSigningKey(idx);
+    }
+    return secp256k1.getPublicKey(this.deriveStaticDepositSecretKey(idx));
+  }
+
+  override getStaticDepositSecretKey(idx: number): Promise<Uint8Array> {
+    if (!this.staticDepositPrivateKey) {
+      return super.getStaticDepositSecretKey(idx);
+    }
+    return Promise.resolve(this.deriveStaticDepositSecretKey(idx));
+  }
+
+  override signSchnorrWithIdentityKey(message: Uint8Array): Promise<Uint8Array> {
+    if (!this.identityPrivateKey) {
+      return super.signSchnorrWithIdentityKey(message);
+    }
+    return Promise.resolve(schnorr.sign(message, this.identityPrivateKey));
+  }
+
+  override signMessageWithIdentityKey(
+    message: Uint8Array,
+    compact?: boolean,
+  ): Promise<Uint8Array> {
+    if (!this.identityPrivateKey) {
+      return super.signMessageWithIdentityKey(message, compact);
+    }
+    const signature = secp256k1.sign(message, this.identityPrivateKey);
+    return Promise.resolve(
+      compact ? signature.toCompactRawBytes() : signature.toDERRawBytes(),
+    );
+  }
+
+  override validateMessageWithIdentityKey(
+    message: Uint8Array,
+    signature: Uint8Array,
+  ): Promise<boolean> {
+    if (!this.identityPrivateKey) {
+      return super.validateMessageWithIdentityKey(message, signature);
+    }
+    return Promise.resolve(
+      secp256k1.verify(
+        signature,
+        message,
+        secp256k1.getPublicKey(this.identityPrivateKey),
+      ),
+    );
+  }
+
+  override async decryptEcies(ciphertext: Uint8Array): Promise<Uint8Array> {
+    if (!this.identityPrivateKey) {
+      return super.decryptEcies(ciphertext);
+    }
+    const privateKey = await getSparkFrost().decryptEcies(
+      ciphertext,
+      this.identityPrivateKey,
+    );
+    return secp256k1.getPublicKey(privateKey);
+  }
+
+  override signTransactionIndex(
+    tx: Transaction,
+    index: number,
+    publicKey: Uint8Array,
+  ): void {
+    if (this.identityPrivateKey && sameBytes(publicKey, secp256k1.getPublicKey(this.identityPrivateKey))) {
+      tx.signIdx(this.identityPrivateKey, index);
+      return;
+    }
+    if (this.depositPrivateKey && sameBytes(publicKey, secp256k1.getPublicKey(this.depositPrivateKey))) {
+      tx.signIdx(this.depositPrivateKey, index);
+      return;
+    }
+    super.signTransactionIndex(tx, index, publicKey);
+  }
+
+  override htlcHMAC(transferID: string): Promise<Uint8Array> {
+    if (!this.htlcPreimagePrivateKey) {
+      return super.htlcHMAC(transferID);
+    }
+    return Promise.resolve(hmac(sha256, this.htlcPreimagePrivateKey, transferID));
   }
 
   override async getPublicKeyFromDerivation(
     keyDerivation: KeyDerivation,
   ): Promise<Uint8Array> {
     if (keyDerivation?.type === KeyDerivationType.LEAF) {
-      return this.publicKey;
+      return this.deriveLeafPublicKey(keyDerivation.path);
     }
     return super.getPublicKeyFromDerivation(keyDerivation);
+  }
+
+  protected override async getSigningPrivateKeyFromDerivation(
+    keyDerivation: KeyDerivation,
+  ): Promise<Uint8Array> {
+    if (keyDerivation.type === KeyDerivationType.LEAF) {
+      throw new Error(
+        "DKG leaf private-key export is disabled; use threshold signing shares",
+      );
+    }
+    return super.getSigningPrivateKeyFromDerivation(keyDerivation);
   }
 
   override getRandomSigningCommitment(): Promise<SigningCommitmentWithOptionalNonce> {
@@ -148,6 +356,7 @@ export class ChillDkgSparkSigner extends DefaultSparkSigner {
     if (params.keyDerivation.type !== KeyDerivationType.LEAF) {
       return super.signFrost(params);
     }
+    const leafPublicKey = this.deriveLeafPublicKey(params.keyDerivation.path);
     const nonceState = this.thresholdNonceStates.get(
       commitmentKey(params.selfCommitment.commitment),
     );
@@ -155,22 +364,13 @@ export class ChillDkgSparkSigner extends DefaultSparkSigner {
       throw new Error("missing DKG nonce for Spark signing commitment");
     }
 
-    const selectedIndexes = this.shares.map((share) => BigInt(share.index));
-    const thresholdSecretContribution = this.shares.reduce((sum, share) => {
-      const lambda = lagrangeCoefficientAtZero(
-        BigInt(share.index),
-        selectedIndexes,
-      );
-      return mod(sum + lambda * share.value, secp256k1.CURVE.n);
-    }, 0n);
-
     const baseParams = {
       message: params.message,
       nonce: nonceState.aggregateNonce,
       selfCommitment: params.selfCommitment.commitment,
       statechainCommitments: params.statechainCommitments ?? {},
       adaptorPubKey: params.adaptorPubKey,
-      publicKey: this.publicKey,
+      publicKey: leafPublicKey,
       verifyingKey: params.verifyingKey,
     };
     const sparkFrost = getSparkFrost();
@@ -178,7 +378,7 @@ export class ChillDkgSparkSigner extends DefaultSparkSigner {
       ...baseParams,
       keyPackage: {
         secretKey: ONE,
-        publicKey: this.publicKey,
+        publicKey: leafPublicKey,
         verifyingKey: params.verifyingKey,
       },
     });
@@ -186,7 +386,7 @@ export class ChillDkgSparkSigner extends DefaultSparkSigner {
       ...baseParams,
       keyPackage: {
         secretKey: TWO,
-        publicKey: this.publicKey,
+        publicKey: leafPublicKey,
         verifyingKey: params.verifyingKey,
       },
     });
@@ -197,13 +397,62 @@ export class ChillDkgSparkSigner extends DefaultSparkSigner {
       secp256k1.CURVE.n,
     );
     const nonceOnlyShare = mod(z1 - effectiveChallenge, secp256k1.CURVE.n);
+    const selectedIndexes = this.shares.map((share) => BigInt(share.index));
+    const participantSignatureContribution = this.shares.reduce(
+      (sum, share) => {
+        const lambda = lagrangeCoefficientAtZero(
+          BigInt(share.index),
+          selectedIndexes,
+        );
+        const partial = mod(
+          effectiveChallenge * lambda * share.value,
+          secp256k1.CURVE.n,
+        );
+        return mod(sum + partial, secp256k1.CURVE.n);
+      },
+      0n,
+    );
+    const tweakSignatureContribution = mod(
+      effectiveChallenge * this.leafTweak(params.keyDerivation.path),
+      secp256k1.CURVE.n,
+    );
     return scalarToBytes(
-      nonceOnlyShare + effectiveChallenge * thresholdSecretContribution,
+      nonceOnlyShare +
+        participantSignatureContribution +
+        tweakSignatureContribution,
     );
   }
 
   getSharesForDebug(): DkgShare[] {
     return this.shares;
+  }
+
+  private deriveLeafPublicKey(path: string): Uint8Array {
+    return deriveDkgLeafPublicKey(this.publicKey, path, this.leafTweak(path));
+  }
+
+  private leafTweak(path: string): bigint {
+    return dkgLeafTweak(path);
+  }
+
+  private deriveStaticDepositSecretKey(idx: number): Uint8Array {
+    if (!this.staticDepositPrivateKey) {
+      throw new Error("Static deposit key not initialized");
+    }
+    return scalarToBytes(
+      mod(
+        bytesToNumberBE(
+          sha256(
+            concatBytes(
+              new TextEncoder().encode("spark-frost-static-deposit"),
+              this.staticDepositPrivateKey,
+              numberToBytesBE(BigInt(idx), 32),
+            ),
+          ),
+        ),
+        secp256k1.CURVE.n,
+      ),
+    );
   }
 }
 
@@ -233,6 +482,20 @@ export function loadKeyshareFile(sharePath: string): ChillDkgKeyshareFile {
     throw new Error(`Not a spark-frost DKG keyshare file: ${sharePath}`);
   }
   return share;
+}
+
+export function loadCoordinatorKeyFile(
+  coordinatorKeyPath: string,
+): CoordinatorKeyFile {
+  const keys = JSON.parse(
+    fs.readFileSync(path.resolve(process.cwd(), coordinatorKeyPath), "utf8"),
+  ) as CoordinatorKeyFile;
+  if (keys.kind !== "spark-frost-coordinator-keys") {
+    throw new Error(
+      `Not a spark-frost coordinator key file: ${coordinatorKeyPath}`,
+    );
+  }
+  return keys;
 }
 
 export function artifactFromSplitFiles(
@@ -282,24 +545,37 @@ export function publicKeyFromGroupFile(groupPath: string): Uint8Array {
 
 export function createPublicOnlyChillDkgSparkSigner(
   groupPath: string,
+  coordinatorKeyPath?: string,
 ): PublicOnlyChillDkgSparkSigner {
-  return new PublicOnlyChillDkgSparkSigner(publicKeyFromGroupFile(groupPath));
+  return new PublicOnlyChillDkgSparkSigner(
+    publicKeyFromGroupFile(groupPath),
+    coordinatorKeyPath ? loadCoordinatorKeyFile(coordinatorKeyPath) : undefined,
+  );
 }
 
 export function createChillDkgSparkSignerFromShareFiles(
   groupPath: string,
   sharePaths: string[],
+  options: {
+    coordinatorKeyPath?: string;
+    coordinatorKeys?: CoordinatorKeyFile;
+  } = {},
 ): ReturnType<typeof createChillDkgSparkSigner> {
   const artifact = artifactFromSplitFiles(groupPath, sharePaths);
   return createChillDkgSparkSigner(
     artifact,
     artifact.participantsOutput.map((participant) => participant.index),
+    options,
   );
 }
 
 export function createChillDkgSparkSigner(
   artifact = loadArtifact(),
   selected = selectedSignerIndexes(),
+  options: {
+    coordinatorKeyPath?: string;
+    coordinatorKeys?: CoordinatorKeyFile;
+  } = {},
 ): {
   artifact: ChillDkgArtifact;
   publicKey: Uint8Array;
@@ -322,23 +598,22 @@ export function createChillDkgSparkSigner(
     publicKey[0] = 2;
   }
   const shares = selectedShares(artifact, selected, negateShares);
+  const coordinatorKeys =
+    options.coordinatorKeys ??
+    (options.coordinatorKeyPath
+      ? loadCoordinatorKeyFile(options.coordinatorKeyPath)
+      : undefined);
   return {
     artifact,
     publicKey,
     negateShares,
     shares,
-    signer: new ChillDkgSparkSigner({ publicKey, shares }),
+    signer: new ChillDkgSparkSigner({
+      publicKey,
+      shares,
+      coordinatorKeys,
+    }),
   };
-}
-
-export function reconstructSelectedSecret(shares: DkgShare[]): bigint {
-  return shares.reduce((sum, share) => {
-    const lambda = lagrangeCoefficientAtZero(
-      BigInt(share.index),
-      shares.map((selected) => BigInt(selected.index)),
-    );
-    return mod(sum + lambda * share.value, secp256k1.CURVE.n);
-  }, 0n);
 }
 
 export function scalarToBytes(value: bigint): Uint8Array {
@@ -365,6 +640,44 @@ export function normalizeSparkPublicKey(publicKey: Uint8Array): Uint8Array {
     normalized[0] = 2;
   }
   return normalized;
+}
+
+export function deriveDkgLeafPublicKey(
+  basePublicKey: Uint8Array,
+  path: string,
+  tweak = dkgLeafTweak(path),
+): Uint8Array {
+  if (tweak === 0n) {
+    return new Uint8Array(basePublicKey);
+  }
+  return secp256k1.Point.fromHex(basePublicKey)
+    .add(secp256k1.Point.BASE.multiply(tweak))
+    .toBytes(true);
+}
+
+export function dkgLeafTweak(path: string): bigint {
+  return mod(
+    bytesToNumberBE(sha256(`spark-frost-dkg-leaf:${path}`)),
+    secp256k1.CURVE.n,
+  );
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  return a.every((value, index) => value === b[index]);
+}
+
+function concatBytes(...arrays: Uint8Array[]): Uint8Array {
+  const length = arrays.reduce((sum, array) => sum + array.length, 0);
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const array of arrays) {
+    out.set(array, offset);
+    offset += array.length;
+  }
+  return out;
 }
 
 function selectedShares(

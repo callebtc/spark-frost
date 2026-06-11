@@ -19,6 +19,42 @@ three stages:
    signature shares one by one.
 3. Execute the funded Spark action using the collected threshold shares.
 
+Current strict mode refuses to export or reconstruct a DKG leaf private key. That
+means proposal/signing works without a mnemonic or composite key, but full Spark
+transfer execution is blocked until the Spark key-tweak/share-generation helper
+APIs are implemented as distributed protocols.
+
+## Coordinator Key
+
+The ceremony writes `coordinator-key.txt` next to `group.txt` and the participant
+share files. This file is not the DKG threshold leaf key.
+
+Spark still needs a client key for wallet initialization, authentication,
+deposit handling, and submitting requests to Spark. In this demo, those Spark
+client identity/deposit/static-deposit/HTLC helper keys live in
+`coordinator-key.txt`.
+
+The file can live with the coordinator process, or it can be copied to whichever
+machine submits Spark requests. Whoever has it can identify as this Spark
+client and submit protocol messages, so it should be treated as private
+operational key material. But it is not enough to move DKG-controlled funds:
+payments from DKG leaves still require threshold participant keyshares. In
+strict mode, this repo refuses to export or reconstruct the DKG leaf private
+key, so a coordinator with only `coordinator-key.txt` cannot produce Spark leaf
+signatures.
+
+For the simplest guided demo from the repo root, run:
+
+```sh
+PYTHON=/path/to/python3.11 NETWORK=REGTEST yarn dkg:demo
+```
+
+For the Lightning version:
+
+```sh
+PYTHON=/path/to/python3.11 NETWORK=REGTEST yarn dkg:demo:lightning
+```
+
 Create keyshares for a 3-of-5 wallet:
 
 ```sh
@@ -55,8 +91,12 @@ NETWORK=REGTEST yarn dkg:ceremony propose \
   --amount 100
 ```
 
-The proposal step uses only the public `group.txt`. It prints the DKG-controlled
-Spark address and the `bcrt1...` Bitcoin deposit address to fund.
+The keygen step also writes `coordinator-key.txt`; see [Coordinator Key](#coordinator-key)
+for the trust boundary around this file.
+
+The proposal step uses the public `group.txt` plus `coordinator-key.txt`. It
+prints the DKG-controlled Spark address and the `bcrt1...` Bitcoin deposit
+address to fund.
 
 Add participants one by one:
 
@@ -78,6 +118,22 @@ NETWORK=REGTEST yarn dkg:ceremony execute \
   --proposal output/3-of-5/proposal-transfer.json \
   --faucet-txid "<faucet-txid>"
 ```
+
+If Spark has recorded the claim but the leaf is not spendable yet, `execute`
+waits for available balance before sending. Use `--wait-seconds 180` to wait
+longer.
+
+Once a send reaches Spark's key-tweak/share-generation step, the strict DKG
+signer intentionally fails rather than exporting a reconstructed leaf private
+key.
+
+After the sender transfer succeeds, the receiver may briefly show the funds as
+`incoming`. The CLI waits for the receiver to auto-claim before cleanup; use
+`--receiver-wait-seconds 180` to wait longer.
+
+To spend from an already-funded FROST wallet, create a new proposal with the
+same group file and coordinator key file, collect threshold signatures again,
+and execute with `--skip-claim` instead of a faucet txid.
 
 For a guided one-command walkthrough:
 
@@ -120,42 +176,9 @@ yarn dkg:spark-smoke
 ```
 
 The smoke test reads the ChillDKG artifact, builds a local Spark-compatible
-threshold signer from the participant shares, confirms the generated Spark
+threshold signer from the participant shares, and confirms the generated Spark
 FROST signature share matches Spark's direct signing path for the same
-threshold public key, and initializes a REGTEST Spark wallet using that
-DKG-backed leaf signer.
-
-To skip the REGTEST wallet initialization and only check signature-share
-compatibility:
-
-```sh
-SKIP_SPARK_WALLET=1 yarn dkg:spark-smoke
-```
-
-## REGTEST Pipeline
-
-Run:
-
-```sh
-NETWORK=REGTEST yarn dkg:pipeline
-```
-
-The first run creates:
-
-- a Spark wallet whose leaf key is the ChillDKG threshold public key
-- a normal Spark receiver wallet
-- a single-use `bcrt1...` Bitcoin deposit address
-- a local state file at `dkg/state/regtest-dkg-demo.json`
-
-Fund the printed `bcrt1...` address at the Lightspark REGTEST faucet, then
-resume:
-
-```sh
-NETWORK=REGTEST FAUCET_TXID="<faucet-txid>" yarn dkg:pipeline
-```
-
-The resumed run claims the deposit, sends a Spark transfer to the normal wallet,
-creates a Lightning invoice, and pays it from the DKG-backed wallet.
+threshold public key.
 
 This is still a local demo: secret shares are loaded into one process for the
 smoke test. A production version would keep each share on its own signer device

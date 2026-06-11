@@ -42,7 +42,8 @@ type CeremonyProposal = {
   threshold: number;
   participants: number;
   dkgThresholdPublicKey: string;
-  frostMnemonic: string;
+  leafKeyDerivationScheme: "additive-path-tweak-v1";
+  coordinatorKeyFile: string;
   frostSparkAddress: string;
   frostDepositAddress: string;
   receiverMnemonic?: string;
@@ -160,6 +161,8 @@ function proposalPayload(proposal: Omit<CeremonyProposal, "proposalHashHex">) {
     threshold: proposal.threshold,
     participants: proposal.participants,
     dkgThresholdPublicKey: proposal.dkgThresholdPublicKey,
+    leafKeyDerivationScheme: proposal.leafKeyDerivationScheme,
+    coordinatorKeyFile: proposal.coordinatorKeyFile,
     frostSparkAddress: proposal.frostSparkAddress,
     frostDepositAddress: proposal.frostDepositAddress,
     receiverSparkAddress: proposal.receiverSparkAddress,
@@ -202,12 +205,31 @@ function runKeygen(args: CliArgs): string {
   if (result.status !== 0) {
     throw new Error("ChillDKG key generation failed");
   }
+  const coordinatorKeyFile = path.join(out, "coordinator-key.txt");
+  writeCoordinatorKeyFile(coordinatorKeyFile);
   console.log("");
   console.log(`Group file: ${path.join(out, "group.txt")}`);
+  console.log(`Coordinator key file: ${coordinatorKeyFile}`);
   for (let i = 1; i <= participants; i += 1) {
     console.log(`Participant ${i}: ${path.join(out, `participant-${i}-share.txt`)}`);
   }
   return out;
+}
+
+function writeCoordinatorKeyFile(filePath: string): void {
+  writeJson(filePath, {
+    kind: "spark-frost-coordinator-keys",
+    version: 1,
+    identityPrivateKeyHex: bytesToHex(secp256k1.utils.randomPrivateKey()),
+    depositPrivateKeyHex: bytesToHex(secp256k1.utils.randomPrivateKey()),
+    staticDepositPrivateKeyHex: bytesToHex(secp256k1.utils.randomPrivateKey()),
+    htlcPreimagePrivateKeyHex: bytesToHex(secp256k1.utils.randomPrivateKey()),
+    notes: [
+      "Coordinator/client identity keys for the Spark session.",
+      "These keys cannot spend DKG-controlled leaves without threshold keyshares.",
+      "Keep this file private.",
+    ],
+  });
 }
 
 async function runPropose(args: CliArgs): Promise<string> {
@@ -231,23 +253,32 @@ async function runPropose(args: CliArgs): Promise<string> {
     "REGTEST",
   );
   const group = loadGroupFile(groupFile);
+  const coordinatorKeyFile = stringOption(
+    args,
+    "coordinator-key",
+    path.join(path.dirname(groupFile), "coordinator-key.txt"),
+  )!;
+  const hasCoordinatorKeys = fs.existsSync(resolveDkgPath(coordinatorKeyFile));
   const publicKey = normalizeSparkPublicKey(
     hexToBytes(group.coordinator.thresholdPubkeyHex),
   );
+  if (!hasCoordinatorKeys) {
+    throw new Error(
+      `Missing coordinator key file ${coordinatorKeyFile}. Run keygen first or pass --coordinator-key.`,
+    );
+  }
 
   console.log("");
   console.log("Stage 2a: coordinator proposes a Spark action");
   console.log("The coordinator only needs the public group file here.");
-  const options = mergeConfigOptionsForNetwork(network);
-  const { wallet: frostWallet, mnemonic: frostMnemonic } =
-    await SparkWallet.initialize({
-      mnemonicOrSeed: stringOption(args, "frost-mnemonic"),
-      options,
-      signer: createPublicOnlyChillDkgSparkSigner(groupFile),
-    });
-  if (!frostMnemonic) {
-    throw new Error("SparkWallet.initialize did not return a FROST wallet mnemonic");
-  }
+  const frostOptions = mergeConfigOptionsForNetwork(network, {
+    signerWithPreExistingKeys: hasCoordinatorKeys,
+  });
+  const normalWalletOptions = mergeConfigOptionsForNetwork(network);
+  const { wallet: frostWallet } = await SparkWallet.initialize({
+    options: frostOptions,
+    signer: createPublicOnlyChillDkgSparkSigner(groupFile, coordinatorKeyFile),
+  });
   const frostSparkAddress = await frostWallet.getSparkAddress();
   const frostDepositAddress = await frostWallet.getSingleUseDepositAddress();
 
@@ -258,7 +289,7 @@ async function runPropose(args: CliArgs): Promise<string> {
   if (!receiverSparkAddress || kind === "lightning") {
     const receiver = await SparkWallet.initialize({
       mnemonicOrSeed: receiverMnemonic,
-      options,
+      options: normalWalletOptions,
     });
     receiverWallet = receiver.wallet;
     receiverMnemonic = receiver.mnemonic;
@@ -283,7 +314,8 @@ async function runPropose(args: CliArgs): Promise<string> {
     threshold: group.threshold,
     participants: group.participants,
     dkgThresholdPublicKey: bytesToHex(publicKey),
-    frostMnemonic,
+    leafKeyDerivationScheme: "additive-path-tweak-v1",
+    coordinatorKeyFile: relativeDkgPath(coordinatorKeyFile),
     frostSparkAddress,
     frostDepositAddress,
     receiverMnemonic,
@@ -310,6 +342,9 @@ async function runPropose(args: CliArgs): Promise<string> {
 
   console.log(`Proposal file: ${proposalFile}`);
   console.log(`FROST Spark address: ${frostSparkAddress}`);
+  if (hasCoordinatorKeys) {
+    console.log(`Coordinator key file: ${coordinatorKeyFile}`);
+  }
   console.log(`Fund this REGTEST Bitcoin deposit address: ${frostDepositAddress}`);
   console.log(`Receiver Spark address: ${receiverSparkAddress}`);
   if (lightningInvoice) {
@@ -372,12 +407,16 @@ async function runExecute(args: CliArgs): Promise<string> {
     throw new Error("Proposal has not reached the threshold signing stage yet");
   }
   const faucetTxid = stringOption(args, "faucet-txid", proposal.execution?.faucetTxid);
-  if (!faucetTxid && !proposal.execution?.claim) {
+  const skipClaim = boolOption(args, "skip-claim");
+  if (!faucetTxid && !proposal.execution?.claim && !skipClaim) {
     console.log("");
     console.log("Stage 3: ready to execute, but the wallet must be funded first.");
     console.log(`Fund this REGTEST Bitcoin deposit address: ${proposal.frostDepositAddress}`);
     console.log(
       `Then run: NETWORK=${proposal.network} yarn dkg:ceremony execute --proposal ${proposalFile} --faucet-txid <txid>`,
+    );
+    console.log(
+      `If this FROST wallet is already funded, rerun with: NETWORK=${proposal.network} yarn dkg:ceremony execute --proposal ${proposalFile} --skip-claim`,
     );
     return proposalFile;
   }
@@ -385,20 +424,26 @@ async function runExecute(args: CliArgs): Promise<string> {
   console.log("");
   console.log("Stage 3: executing with the collected threshold keyshares");
   const shareFiles = proposal.signing.signers.map((signer) => signer.shareFile);
+  if (!proposal.coordinatorKeyFile) {
+    throw new Error("Proposal is missing coordinatorKeyFile");
+  }
   const { signer } = createChillDkgSparkSignerFromShareFiles(
     proposal.groupFile,
     shareFiles,
+    { coordinatorKeyPath: proposal.coordinatorKeyFile },
   );
-  const options = mergeConfigOptionsForNetwork(proposal.network);
+  const frostOptions = mergeConfigOptionsForNetwork(proposal.network, {
+    signerWithPreExistingKeys: true,
+  });
   const { wallet: frostWallet } = await SparkWallet.initialize({
-    mnemonicOrSeed: proposal.frostMnemonic,
-    options,
+    options: frostOptions,
     signer,
   });
+  const normalWalletOptions = mergeConfigOptionsForNetwork(proposal.network);
   const receiver = proposal.receiverMnemonic
     ? await SparkWallet.initialize({
         mnemonicOrSeed: proposal.receiverMnemonic,
-        options,
+        options: normalWalletOptions,
       })
     : undefined;
 
@@ -408,11 +453,29 @@ async function runExecute(args: CliArgs): Promise<string> {
     proposal.execution.claim = await frostWallet.claimDeposit(faucetTxid);
     writeJson(proposalFile, proposal);
     console.log("Deposit claimed into the DKG-controlled Spark wallet.");
+  } else if (!proposal.execution.claim && skipClaim) {
+    console.log("Skipping deposit claim; spending from existing FROST wallet balance.");
   } else {
     console.log("Deposit claim already recorded.");
   }
 
   if (!proposal.execution.result) {
+    const requiredAvailableSats =
+      proposal.payment.kind === "lightning"
+        ? BigInt(
+            proposal.payment.amountSats + (proposal.payment.maxFeeSats ?? 1000),
+          )
+        : BigInt(proposal.payment.amountSats);
+    await waitForAvailableBalance({
+      wallet: frostWallet,
+      requiredAvailableSats,
+      timeoutMs: numberOption(args, "wait-seconds", 90) * 1000,
+      pollMs: numberOption(args, "poll-ms", 5000),
+      proposalFile,
+      faucetTxid,
+      network: proposal.network,
+    });
+
     if (proposal.payment.kind === "transfer") {
       proposal.execution.result = await frostWallet.transfer({
         receiverSparkAddress: proposal.receiverSparkAddress!,
@@ -433,11 +496,104 @@ async function runExecute(args: CliArgs): Promise<string> {
 
   console.log("FROST wallet balance:", await frostWallet.getBalance());
   if (receiver) {
+    await waitForReceiverSettlement({
+      wallet: receiver.wallet,
+      expectedReceivedSats: BigInt(proposal.payment.amountSats),
+      timeoutMs: numberOption(args, "receiver-wait-seconds", 90) * 1000,
+      pollMs: numberOption(args, "poll-ms", 5000),
+    });
     console.log("Receiver wallet balance:", await receiver.wallet.getBalance());
   }
   await frostWallet.cleanup();
   await receiver?.wallet.cleanup();
   return proposalFile;
+}
+
+async function waitForAvailableBalance({
+  wallet,
+  requiredAvailableSats,
+  timeoutMs,
+  pollMs,
+  proposalFile,
+  faucetTxid,
+  network,
+}: {
+  wallet: SparkWallet;
+  requiredAvailableSats: bigint;
+  timeoutMs: number;
+  pollMs: number;
+  proposalFile: string;
+  faucetTxid?: string;
+  network: NetworkType;
+}) {
+  const started = Date.now();
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    const balance = await wallet.getBalance();
+    const available = balance.satsBalance.available;
+    const owned = balance.satsBalance.owned;
+    const incoming = balance.satsBalance.incoming;
+    console.log(
+      `available balance check ${attempt}: available=${available} owned=${owned} incoming=${incoming}`,
+    );
+    if (available >= requiredAvailableSats) {
+      return;
+    }
+    if (Date.now() - started >= timeoutMs) {
+      throw new Error(
+        [
+          `Claim is recorded, but only ${available} sats are currently spendable; ${requiredAvailableSats} sats are needed.`,
+          "This usually means Spark has not made the claimed leaf available yet.",
+          `Retry: NETWORK=${network} yarn dkg:ceremony execute --proposal ${proposalFile}${
+            faucetTxid ? ` --faucet-txid ${faucetTxid}` : ""
+          }`,
+          "If you are spending an already-funded wallet, include --skip-claim.",
+          "You can wait longer with --wait-seconds <seconds>.",
+        ].join("\n"),
+      );
+    }
+    await sleep(pollMs);
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitForReceiverSettlement({
+  wallet,
+  expectedReceivedSats,
+  timeoutMs,
+  pollMs,
+}: {
+  wallet: SparkWallet;
+  expectedReceivedSats: bigint;
+  timeoutMs: number;
+  pollMs: number;
+}) {
+  const started = Date.now();
+  let attempt = 0;
+  while (true) {
+    attempt += 1;
+    const balance = await wallet.getBalance();
+    const available = balance.satsBalance.available;
+    const owned = balance.satsBalance.owned;
+    const incoming = balance.satsBalance.incoming;
+    console.log(
+      `receiver settlement check ${attempt}: available=${available} owned=${owned} incoming=${incoming}`,
+    );
+    if (incoming === 0n && available >= expectedReceivedSats) {
+      return;
+    }
+    if (Date.now() - started >= timeoutMs) {
+      console.log(
+        "Receiver transfer is still settling. Reinitialize the receiver wallet later if the balance has not moved from incoming to available.",
+      );
+      return;
+    }
+    await sleep(pollMs);
+  }
 }
 
 async function runWalkthrough(args: CliArgs) {
@@ -607,6 +763,7 @@ Commands:
   propose     --group output/3-of-5/group.txt --kind transfer --amount 1000
   sign        --proposal output/3-of-5/proposal.json --share output/3-of-5/participant-1-share.txt
   execute     --proposal output/3-of-5/proposal.json --faucet-txid <txid>
+  execute     --proposal output/3-of-5/proposal.json --skip-claim
   walkthrough --threshold 2 --participants 3 --out output/walkthrough --yes
 
 Payment kinds:
