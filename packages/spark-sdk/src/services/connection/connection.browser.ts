@@ -1,0 +1,102 @@
+import {
+  retryMiddleware,
+  type RetryOptions,
+} from "nice-grpc-client-middleware-retry";
+import type { ClientMiddleware } from "nice-grpc-common";
+import { type Metadata, Status } from "nice-grpc-common";
+import {
+  createChannel,
+  createClientFactory,
+  FetchTransport,
+  type Channel as ChannelWeb,
+  type ClientFactory as ClientFactoryWeb,
+} from "nice-grpc-web";
+import { getClientEnv } from "../../constants.js";
+import { SparkRequestError } from "../../errors/types.js";
+import type { SparkServiceDefinition } from "../../proto/spark.js";
+import type { SparkAuthnServiceDefinition } from "../../proto/spark_authn.js";
+import type { SparkTokenServiceDefinition } from "../../proto/spark_token.js";
+import { type WalletConfigService } from "../config.js";
+import { getMonotonicTime } from "../time-sync.js";
+import type { LoggingService } from "../../utils/logging-service.js";
+import { type AuthMode, ConnectionManager } from "./connection.js";
+
+export type Transport = NonNullable<Parameters<typeof createChannel>[1]>;
+
+export class ConnectionManagerBrowser extends ConnectionManager {
+  protected transport: Transport;
+
+  constructor(
+    config: WalletConfigService,
+    authMode: AuthMode = "identity",
+    transport = FetchTransport(),
+    logging?: LoggingService,
+  ) {
+    super(config, authMode, logging);
+    this.transport = transport;
+  }
+
+  protected getMonotonicTime(): number {
+    return getMonotonicTime();
+  }
+
+  protected prepareMetadata(metadata: Metadata): Metadata {
+    return super
+      .prepareMetadata(metadata)
+      .set("X-Requested-With", "XMLHttpRequest")
+      .set("X-Grpc-Web", "1")
+      .set("X-Client-Env", getClientEnv())
+      .set("Content-Type", "application/grpc-web+proto");
+  }
+
+  protected createChannelWithTLS(address: string): Promise<ChannelWeb> {
+    try {
+      return Promise.resolve(createChannel(address, this.transport));
+    } catch (error) {
+      throw new SparkRequestError("Failed to create channel", {
+        url: address,
+        error,
+      });
+    }
+  }
+
+  protected async createGrpcClient<T>(
+    definition:
+      | SparkAuthnServiceDefinition
+      | SparkServiceDefinition
+      | SparkTokenServiceDefinition,
+    channel: ChannelWeb,
+    withRetries: boolean,
+    middleware?: ClientMiddleware<RetryOptions, object>,
+    channelKey?: string,
+  ): Promise<T & { close?: () => void }> {
+    let clientFactory: ClientFactoryWeb;
+
+    const retryOptions = {
+      retry: true,
+      retryMaxAttempts: 3,
+      retryBaseDelayMs: 1000,
+      retryMaxDelayMs: 10000,
+      retryableStatuses: [Status.UNAVAILABLE, Status.CANCELLED],
+    };
+    let options: RetryOptions = {};
+
+    clientFactory = createClientFactory();
+    if (withRetries) {
+      options = retryOptions;
+      clientFactory = clientFactory.use(retryMiddleware);
+    }
+    if (middleware) {
+      clientFactory = clientFactory.use(middleware);
+    }
+    const client = clientFactory.create(definition, channel, {
+      "*": options,
+    }) as T;
+    return Promise.resolve({
+      ...client,
+      close: channelKey
+        ? () => ConnectionManager.releaseChannel(channelKey)
+        : undefined,
+    });
+  }
+}

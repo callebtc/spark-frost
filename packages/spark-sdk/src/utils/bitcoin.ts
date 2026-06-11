@@ -1,0 +1,326 @@
+import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
+import { bytesToHex, bytesToNumberBE, hexToBytes } from "@noble/curves/utils";
+
+import { sha256 } from "@noble/hashes/sha2";
+import * as btc from "@scure/btc-signer";
+import { type TransactionOutput } from "@scure/btc-signer/psbt";
+import { equalBytes } from "@scure/btc-signer/utils";
+import { SparkValidationError } from "../errors/index.js";
+import { getNetwork, type Network } from "./network.js";
+
+// const t = tapTweak(pubKey, h); // t = int_from_bytes(tagged_hash("TapTweak", pubkey + h)
+// const P = u.lift_x(u.bytesToNumberBE(pubKey)); // P = lift_x(int_from_bytes(pubkey))
+// const Q = P.add(Point.fromPrivateKey(t)); // Q = point_add(P, point_mul(G, t))
+export function computeTaprootKeyNoScript(pubkey: Uint8Array): Uint8Array {
+  if (pubkey.length !== 32) {
+    throw new SparkValidationError("Public key must be 32 bytes", {
+      field: "pubkey",
+      value: pubkey.length,
+      expected: 32,
+    });
+  }
+
+  const taggedHash = schnorr.utils.taggedHash("TapTweak", pubkey);
+  const tweak = bytesToNumberBE(taggedHash);
+
+  // Get the original point
+  const P = schnorr.utils.lift_x(schnorr.utils.bytesToNumberBE(pubkey));
+
+  // Add the tweak times the generator point
+  const Q = P.add(secp256k1.Point.fromPrivateKey(tweak));
+
+  return Q.toBytes();
+}
+
+export function getP2TRScriptFromPublicKey(
+  pubKey: Uint8Array,
+  network: Network,
+): Uint8Array {
+  if (pubKey.length !== 33) {
+    throw new SparkValidationError("Public key must be 33 bytes", {
+      field: "pubKey",
+      value: pubKey.length,
+      expected: 33,
+    });
+  }
+
+  const internalKey = secp256k1.Point.fromHex(pubKey);
+  const script = btc.p2tr(
+    internalKey.toBytes().slice(1, 33),
+    undefined,
+    getNetwork(network),
+  ).script;
+  if (!script) {
+    throw new SparkValidationError("Failed to get P2TR script", {
+      field: "script",
+      value: "null",
+    });
+  }
+  return script;
+}
+
+export function getP2TRAddressFromPublicKey(
+  pubKey: Uint8Array,
+  network: Network,
+): string {
+  if (pubKey.length !== 33) {
+    throw new SparkValidationError("Public key must be 33 bytes", {
+      field: "pubKey",
+      value: pubKey.length,
+      expected: 33,
+    });
+  }
+
+  const internalKey = secp256k1.Point.fromHex(pubKey);
+  const address = btc.p2tr(
+    internalKey.toBytes().slice(1, 33),
+    undefined,
+    getNetwork(network),
+  ).address;
+  if (!address) {
+    throw new SparkValidationError("Failed to get P2TR address", {
+      field: "address",
+      value: "null",
+    });
+  }
+  return address;
+}
+
+export function getP2TRAddressFromPkScript(
+  pkScript: Uint8Array,
+  network: Network,
+): string {
+  if (pkScript.length !== 34 || pkScript[0] !== 0x51 || pkScript[1] !== 0x20) {
+    throw new SparkValidationError("Invalid pkscript", {
+      field: "pkScript",
+      value: bytesToHex(pkScript),
+      expected: "34 bytes starting with 0x51 0x20",
+    });
+  }
+
+  const parsedScript = btc.OutScript.decode(pkScript);
+
+  return btc.Address(getNetwork(network)).encode(parsedScript);
+}
+
+export function getP2WPKHAddressFromPublicKey(
+  pubKey: Uint8Array,
+  network: Network,
+): string {
+  if (pubKey.length !== 33) {
+    throw new SparkValidationError("Public key must be 33 bytes", {
+      field: "pubKey",
+      value: pubKey.length,
+      expected: 33,
+    });
+  }
+
+  const address = btc.p2wpkh(pubKey, getNetwork(network)).address;
+  if (!address) {
+    throw new SparkValidationError("Failed to get P2WPKH address", {
+      field: "address",
+      value: "null",
+    });
+  }
+  return address;
+}
+
+export function getTxFromRawTxHex(rawTxHex: string): btc.Transaction {
+  const txBytes = hexToBytes(rawTxHex);
+  const tx = btc.Transaction.fromRaw(txBytes, {
+    allowUnknownOutputs: true,
+  });
+
+  if (!tx) {
+    throw new SparkValidationError("Failed to parse transaction", {
+      field: "tx",
+      value: "null",
+    });
+  }
+  return tx;
+}
+
+export function getTxFromRawTxBytes(rawTxBytes: Uint8Array): btc.Transaction {
+  const tx = btc.Transaction.fromRaw(rawTxBytes, {
+    allowUnknownOutputs: true,
+  });
+  if (!tx) {
+    throw new SparkValidationError("Failed to parse transaction", {
+      field: "tx",
+      value: "null",
+    });
+  }
+  return tx;
+}
+
+export function getSigHashFromTx(
+  tx: btc.Transaction,
+  inputIndex: number,
+  prevOutput: TransactionOutput,
+): Uint8Array {
+  const prevScript = prevOutput.script;
+  if (!prevScript) {
+    throw new SparkValidationError("No script found in prevOutput", {
+      field: "prevScript",
+      value: "null",
+    });
+  }
+
+  const amount = prevOutput.amount;
+  if (!amount) {
+    throw new SparkValidationError("No amount found in prevOutput", {
+      field: "amount",
+      value: "null",
+    });
+  }
+
+  return tx.preimageWitnessV1(
+    inputIndex,
+    Array<Uint8Array>(tx.inputsLength).fill(prevScript),
+    btc.SigHash.DEFAULT,
+    Array<bigint>(tx.inputsLength).fill(amount),
+  );
+}
+
+/**
+ * Computes sighash for a multi-input Taproot transaction.
+ * Per BIP 341, the sighash commits to ALL inputs' prevout amounts and scriptPubKeys.
+ *
+ * @param tx - The transaction to compute sighash for
+ * @param inputIndex - The index of the input being signed
+ * @param prevOutputs - Array of prevOutputs, one per input (must match tx.inputsLength)
+ * @returns The sighash bytes
+ */
+export function getSigHashFromMultiInputTx(
+  tx: btc.Transaction,
+  inputIndex: number,
+  prevOutputs: TransactionOutput[],
+): Uint8Array {
+  if (prevOutputs.length !== tx.inputsLength) {
+    throw new SparkValidationError(
+      "prevOutputs length must match transaction inputs length",
+      {
+        field: "prevOutputs",
+        value: prevOutputs.length,
+        expected: tx.inputsLength,
+      },
+    );
+  }
+  const prevScripts: Uint8Array[] = [];
+  const prevAmounts: bigint[] = [];
+  for (const prevOutput of prevOutputs) {
+    if (!prevOutput.script) {
+      throw new SparkValidationError("No script found in prevOutput", {
+        field: "prevScript",
+        value: "null",
+      });
+    }
+    if (prevOutput.amount === undefined) {
+      throw new SparkValidationError("No amount found in prevOutput", {
+        field: "amount",
+        value: "null",
+      });
+    }
+    prevScripts.push(prevOutput.script);
+    prevAmounts.push(prevOutput.amount);
+  }
+  return tx.preimageWitnessV1(
+    inputIndex,
+    prevScripts,
+    btc.SigHash.DEFAULT,
+    prevAmounts,
+  );
+}
+
+export function getTxId(tx: btc.Transaction): string {
+  return bytesToHex(sha256(sha256(tx.toBytes(true))).reverse());
+}
+
+export function getTxIdNoReverse(tx: btc.Transaction): string {
+  return bytesToHex(sha256(sha256(tx.toBytes(true))));
+}
+
+/**
+ * Validates that an SSP-supplied cooperative-exit L1 transaction actually pays
+ * the user's requested withdrawal address for at least the expected amount, and
+ * that its txid matches the `coopExitTxid` the SSP returned alongside it.
+ *
+ * Without this check a malicious SSP can redirect the on-chain payout while
+ * still returning an internally-consistent connector transaction and txid, and
+ * the SDK would sign cooperative-exit refund material for a transaction the
+ * user never authorized.
+ */
+export function validateCoopExitPayoutTransaction({
+  rawCoopExitTransaction,
+  expectedCoopExitTxid,
+  expectedPayoutAddress,
+  expectedPayoutAmountSats,
+  network,
+}: {
+  rawCoopExitTransaction: string;
+  expectedCoopExitTxid: string;
+  expectedPayoutAddress: string;
+  expectedPayoutAmountSats: number;
+  network: Network;
+}): void {
+  const tx = getTxFromRawTxHex(rawCoopExitTransaction);
+
+  const actualTxid = getTxId(tx);
+  if (actualTxid !== expectedCoopExitTxid) {
+    throw new SparkValidationError(
+      "SSP coop exit response is inconsistent: coopExitTxid does not match rawCoopExitTransaction",
+      {
+        field: "coopExitTxid",
+        value: expectedCoopExitTxid,
+        expected: actualTxid,
+      },
+    );
+  }
+
+  let expectedScript: Uint8Array;
+  try {
+    expectedScript = btc.OutScript.encode(
+      btc.Address(getNetwork(network)).decode(expectedPayoutAddress),
+    );
+  } catch (cause) {
+    throw new SparkValidationError(
+      "Could not decode withdrawal address for payout validation",
+      {
+        field: "onchainAddress",
+        value: expectedPayoutAddress,
+        cause: cause instanceof Error ? cause.message : String(cause),
+      },
+    );
+  }
+
+  for (let i = 0; i < tx.outputsLength; i++) {
+    const output = tx.getOutput(i);
+    if (!output?.script || output.amount === undefined) continue;
+    if (!equalBytes(output.script, expectedScript)) continue;
+    if (output.amount >= BigInt(expectedPayoutAmountSats)) {
+      return;
+    }
+  }
+
+  throw new SparkValidationError(
+    "SSP cooperative exit transaction does not pay the requested withdrawal address for the expected amount",
+    {
+      field: "rawCoopExitTransaction",
+      value: expectedPayoutAddress,
+      expected: `>= ${expectedPayoutAmountSats} sats to requested address`,
+    },
+  );
+}
+
+export function getTxEstimatedVbytesSizeByNumberOfInputsOutputs(
+  numInputs: number,
+  numOutputs: number,
+): number {
+  // constants (all in vbytes)
+  const TX_OVERHEAD = 10; // usual tx overhead
+  const IN_VBYTES = 150; // largest potential input size
+  const OUT_VBYTES = 34; // average output size
+
+  // total
+  return TX_OVERHEAD + numInputs * IN_VBYTES + numOutputs * OUT_VBYTES;
+}

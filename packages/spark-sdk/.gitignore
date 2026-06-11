@@ -1,0 +1,15 @@
+node_modules/*
+**/node_modules/*
+
+.yarn/*
+.pnp.*
+
+lib/
+ios/build/
+ios/Pods/
+
+android/build/
+android/.gradle/
+android/local.properties
+
+wasm/browser/

@@ -1,0 +1,660 @@
+import { schnorr, secp256k1 } from "@noble/curves/secp256k1";
+import { bytesToHex, hexToBytes } from "@noble/curves/utils";
+import { sha256 } from "@noble/hashes/sha2";
+import { concatBytes, utf8ToBytes } from "@noble/hashes/utils";
+import * as btc from "@scure/btc-signer";
+import { Address, OutScript, SigHash, Transaction } from "@scure/btc-signer";
+import {
+  type TransactionInput,
+  type TransactionOutput,
+} from "@scure/btc-signer/psbt";
+import { taprootTweakPrivKey } from "@scure/btc-signer/utils";
+import { SparkRequestError } from "../../errors/index.js";
+import {
+  getP2TRAddressFromPkScript,
+  getP2TRAddressFromPublicKey,
+  getP2TRScriptFromPublicKey,
+  getP2WPKHAddressFromPublicKey,
+} from "../../utils/bitcoin.js";
+import { getFetch } from "../../utils/fetch.js";
+import { getNetwork, Network } from "../../utils/network.js";
+
+// Static keys for deterministic testing
+// P2TRAddress: bcrt1p2uy9zw5ltayucsuzl4tet6ckelzawp08qrtunacscsszflye907q62uqhl
+const STATIC_FAUCET_KEY = hexToBytes(
+  "deadbeef1337cafe4242424242424242deadbeef1337cafe4242424242424242",
+);
+
+// P2TRAddress: bcrt1pwr5k38p68ceyrnm2tvrp50dvmg3grh6uvayjl3urwtxejhd3dw4swz6p58
+const STATIC_MINING_KEY = hexToBytes(
+  "1337cafe4242deadbeef4242424242421337cafe4242deadbeef424242424242",
+);
+const SATS_PER_BTC = 100_000_000;
+const DEFAULT_FAUCET_NAMESPACE = "spark-sdk";
+
+function getFaucetNamespace() {
+  const suffix =
+    process.env.SPARK_TEST_FAUCET_NAMESPACE ||
+    (process.env.GITHUB_RUN_ID
+      ? `${process.env.GITHUB_RUN_ID}-${process.env.GITHUB_RUN_ATTEMPT || "1"}`
+      : "local");
+  return `${DEFAULT_FAUCET_NAMESPACE}:${suffix}`;
+}
+
+function derivePrivateKey(
+  baseKey: Uint8Array,
+  namespace: string,
+  role: "faucet" | "miner",
+) {
+  let material = concatBytes(baseKey, utf8ToBytes(`|${namespace}|${role}|v1`));
+  for (let i = 0; i < 1024; i++) {
+    const candidate = sha256(material);
+    if (secp256k1.utils.isValidPrivateKey(candidate)) {
+      return candidate;
+    }
+    material = concatBytes(candidate, utf8ToBytes(`|retry:${i}`));
+  }
+  throw new Error("Failed to derive a valid secp256k1 private key");
+}
+
+export type FaucetCoin = {
+  key: Uint8Array;
+  outpoint: TransactionInput;
+  txout: TransactionOutput;
+};
+
+type FaucetUtxo = {
+  txid: string;
+  vout: number;
+  amount: bigint;
+};
+
+type ScanTxOutSetResult = {
+  success: boolean;
+  height: number;
+  unspents: Array<{
+    txid: string;
+    vout: number;
+    amount: number;
+    height: number;
+  }>;
+};
+
+type RawTransactionInfo = {
+  hex: string;
+  confirmations?: number;
+};
+
+// The amount of satoshis to put in each faucet coin to be used in tests
+const REFILL_AMOUNT = 10_000_000n;
+const COIN_AMOUNT = 1_000_000n;
+const FEE_AMOUNT = 1000n;
+const TARGET_NUM_COINS = 20;
+
+export class BitcoinFaucet {
+  private coins: FaucetCoin[] = [];
+  private static instance: BitcoinFaucet | null = null;
+  private miningAddress: string;
+  private lock: Promise<void> = Promise.resolve();
+  private readonly faucetKey: Uint8Array;
+  private readonly miningKey: Uint8Array;
+
+  private constructor(
+    private url: string,
+    private username: string,
+    private password: string,
+  ) {
+    const namespace = getFaucetNamespace();
+    this.faucetKey = derivePrivateKey(STATIC_FAUCET_KEY, namespace, "faucet");
+    this.miningKey = derivePrivateKey(STATIC_MINING_KEY, namespace, "miner");
+    this.miningAddress = getP2TRAddressFromPublicKey(
+      secp256k1.getPublicKey(this.miningKey),
+      Network.LOCAL,
+    );
+  }
+
+  static getInstance(): BitcoinFaucet {
+    if (!BitcoinFaucet.instance) {
+      const localIngressHost = process.env.SPARK_LOCAL_INGRESS_HOST;
+      const url =
+        process.env.BITCOIN_RPC_URL ||
+        (localIngressHost
+          ? `http://${localIngressHost}:8332`
+          : "http://127.0.0.1:8332");
+      const username = process.env.BITCOIN_RPC_USER || "testutil";
+      const password = process.env.BITCOIN_RPC_PASSWORD || "testutilpassword";
+
+      BitcoinFaucet.instance = new BitcoinFaucet(url, username, password);
+    }
+    return BitcoinFaucet.instance;
+  }
+
+  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+    const current = this.lock;
+    let resolve: () => void;
+    this.lock = new Promise<void>((r) => (resolve = r));
+    await current;
+    try {
+      return await operation();
+    } finally {
+      resolve!();
+    }
+  }
+
+  async fund(): Promise<FaucetCoin> {
+    return this.withLock(async () => {
+      if (this.coins.length === 0) {
+        await this.refill();
+      }
+
+      const coin = this.coins[0];
+      if (!coin) {
+        throw new Error("Failed to get coin from faucet");
+      }
+      this.coins = this.coins.slice(1);
+      return coin;
+    });
+  }
+
+  private async refill(): Promise<void> {
+    const minerPubKey = secp256k1.getPublicKey(this.miningKey);
+    const address = getP2TRAddressFromPublicKey(minerPubKey, Network.LOCAL);
+
+    // Use scantxoutset to find UTXOs. Retry on "Scan already in progress" (-8)
+    // which happens when concurrent test processes hit the same bitcoind.
+    const scanResult = await this.callWithRetry<ScanTxOutSetResult>(
+      "scantxoutset",
+      ["start", [`addr(${address})`]],
+    );
+
+    let selectedUtxo: FaucetUtxo | undefined;
+    if (scanResult.success && scanResult.unspents.length > 0) {
+      const scannedUtxo = scanResult.unspents.find((utxo) => {
+        const isValueEnough =
+          BigInt(Math.floor(utxo.amount * SATS_PER_BTC)) >=
+          COIN_AMOUNT + FEE_AMOUNT;
+        const isMature = scanResult.height - utxo.height >= 100;
+        return isValueEnough && isMature;
+      });
+
+      if (scannedUtxo) {
+        selectedUtxo = {
+          txid: scannedUtxo.txid,
+          vout: scannedUtxo.vout,
+          amount: BigInt(Math.floor(scannedUtxo.amount * SATS_PER_BTC)),
+        };
+      }
+    }
+
+    if (!selectedUtxo) {
+      // Nothing found while scanning, so send some coins to ourselves from the node wallet.
+      const fundingTxid = await this.sendToAddressInternal(
+        address,
+        Number(REFILL_AMOUNT),
+      );
+
+      await this.generateToAddress(1, address);
+
+      const fundingTxRaw = await this.getRawTransaction(fundingTxid);
+      const fundingTx = Transaction.fromRaw(hexToBytes(fundingTxRaw.hex));
+
+      for (let i = 0; i < fundingTx.outputsLength; i++) {
+        const output = fundingTx.getOutput(i);
+
+        if (!output.script || !output.amount) continue;
+
+        const outputAddress = getP2TRAddressFromPkScript(
+          output.script,
+          Network.LOCAL,
+        );
+
+        if (outputAddress === address && output.amount === REFILL_AMOUNT) {
+          selectedUtxo = {
+            txid: fundingTxid,
+            vout: i,
+            amount: REFILL_AMOUNT,
+          };
+          break;
+        }
+      }
+    }
+
+    if (!selectedUtxo) {
+      // Still no UTXO, give up.
+      throw new Error("No UTXO large enough to create even one faucet coin");
+    }
+
+    const selectedUtxoAmountSats = selectedUtxo.amount;
+    const maxPossibleCoins = Number(
+      (selectedUtxoAmountSats - FEE_AMOUNT) / COIN_AMOUNT,
+    );
+    const numCoinsToCreate = Math.min(maxPossibleCoins, TARGET_NUM_COINS);
+
+    if (numCoinsToCreate < 1) {
+      throw new Error(
+        `Selected UTXO (${selectedUtxoAmountSats} sats) is too small to create even one faucet coin of ${COIN_AMOUNT} sats`,
+      );
+    }
+
+    const splitTx = new Transaction();
+    splitTx.addInput({
+      txid: selectedUtxo.txid,
+      index: selectedUtxo.vout,
+    });
+
+    const faucetPubKey = secp256k1.getPublicKey(this.faucetKey);
+    const script = getP2TRScriptFromPublicKey(faucetPubKey, Network.LOCAL);
+    for (let i = 0; i < numCoinsToCreate; i++) {
+      splitTx.addOutput({
+        script,
+        amount: COIN_AMOUNT,
+      });
+    }
+
+    const remainingValue =
+      selectedUtxoAmountSats -
+      COIN_AMOUNT * BigInt(numCoinsToCreate) -
+      FEE_AMOUNT;
+    const minerScript = getP2TRScriptFromPublicKey(minerPubKey, Network.LOCAL);
+    if (remainingValue > 0n) {
+      splitTx.addOutput({
+        script: minerScript,
+        amount: remainingValue,
+      });
+    }
+
+    const signedSplitTx = await this.signFaucetCoin(
+      splitTx,
+      {
+        amount: selectedUtxoAmountSats,
+        script: minerScript,
+      },
+      this.miningKey,
+    );
+
+    await this.broadcastTx(bytesToHex(signedSplitTx.extract()));
+
+    const splitTxId = signedSplitTx.id;
+    for (let i = 0; i < numCoinsToCreate; i++) {
+      this.coins.push({
+        key: this.faucetKey,
+        outpoint: {
+          txid: hexToBytes(splitTxId),
+          index: i,
+        },
+        txout: signedSplitTx.getOutput(i),
+      });
+    }
+  }
+
+  async sendFaucetCoinToP2WPKHAddress(pubKey: Uint8Array) {
+    const sendToPubKeyTx = new Transaction();
+
+    // For P2WPKH, we need to hash the public key
+
+    // Create a P2WPKH address
+    const p2wpkhAddress = btc.p2wpkh(pubKey, getNetwork(Network.LOCAL)).address;
+    if (!p2wpkhAddress) {
+      throw new Error("Invalid P2WPKH address");
+    }
+
+    // Get the coin to spend
+    const coinToSend = await this.fund();
+    if (!coinToSend) {
+      throw new Error("No coins available");
+    }
+
+    // Add the input
+    sendToPubKeyTx.addInput(coinToSend.outpoint);
+
+    // Add the output using the address directly, but subtract FEE_AMOUNT to ensure there's a fee
+    sendToPubKeyTx.addOutputAddress(
+      p2wpkhAddress,
+      COIN_AMOUNT - FEE_AMOUNT,
+      getNetwork(Network.LOCAL),
+    );
+
+    // Sign the transaction and get the signed result
+    const signedTx = await this.signFaucetCoin(
+      sendToPubKeyTx,
+      coinToSend.txout,
+      coinToSend.key,
+    );
+
+    // Broadcast the signed transaction
+    await this.broadcastTx(bytesToHex(signedTx.extract()));
+  }
+
+  async signFaucetCoin(
+    unsignedTx: Transaction,
+    fundingTxOut: TransactionOutput,
+    key: Uint8Array,
+  ): Promise<Transaction> {
+    await Promise.resolve();
+    const pubKey = secp256k1.getPublicKey(key);
+    const internalKey = pubKey.slice(1); // Remove the 0x02/0x03 prefix
+
+    const script = getP2TRScriptFromPublicKey(pubKey, Network.LOCAL);
+
+    unsignedTx.updateInput(0, {
+      tapInternalKey: internalKey,
+      witnessUtxo: {
+        script,
+        amount: fundingTxOut.amount!,
+      },
+    });
+
+    const sighash = unsignedTx.preimageWitnessV1(
+      0,
+      Array<Uint8Array>(unsignedTx.inputsLength).fill(script),
+      SigHash.DEFAULT,
+      Array<bigint>(unsignedTx.inputsLength).fill(fundingTxOut.amount!),
+    );
+
+    const merkleRoot = new Uint8Array();
+    const tweakedKey = taprootTweakPrivKey(key, merkleRoot);
+    if (!tweakedKey)
+      throw new Error("Invalid private key for taproot tweaking");
+
+    const signature = schnorr.sign(sighash, tweakedKey);
+
+    unsignedTx.updateInput(0, {
+      tapKeySig: signature,
+    });
+
+    unsignedTx.finalize();
+
+    return unsignedTx;
+  }
+
+  // MineBlocks mines the specified number of blocks to a random address
+  // and returns the block hashes.
+  async mineBlocks(numBlocks: number) {
+    return await this.generateToAddress(numBlocks, this.miningAddress);
+  }
+
+  async mineBlocksAndWaitForMiningToComplete(numBlocks: number) {
+    const startBlock = await this.getBlockCount();
+
+    await this.mineBlocks(numBlocks);
+
+    await this.waitForBlocksMined({
+      startBlock,
+      expectedIncrease: numBlocks,
+    });
+  }
+
+  private async callWithRetry<T>(
+    method: string,
+    params: unknown[],
+    { maxAttempts = 5, baseDelayMs = 200, maxDelayMs = 3000 } = {},
+  ): Promise<T> {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await this.call<T>(method, params);
+      } catch (err) {
+        const isRetryable =
+          err instanceof SparkRequestError &&
+          err.message?.includes("Scan already in progress");
+        if (!isRetryable || attempt === maxAttempts) throw err;
+        const delay =
+          Math.min(baseDelayMs * 2 ** (attempt - 1), maxDelayMs) +
+          Math.random() * 100;
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+    throw new Error("Unexpected retry loop exit");
+  }
+
+  private async call<T>(method: string, params: unknown[]): Promise<T> {
+    try {
+      const { fetch, Headers } = getFetch();
+      const response = await fetch(this.url, {
+        method: "POST",
+        headers: new Headers({
+          "Content-Type": "application/json",
+          Authorization: "Basic " + btoa(`${this.username}:${this.password}`),
+        }),
+        body: JSON.stringify({
+          jsonrpc: "1.0",
+          id: "spark-js",
+          method,
+          params,
+        }),
+      });
+
+      const data = await response.json<{
+        error?: { code?: unknown };
+        result: T;
+      }>();
+      if (data.error) {
+        console.error(`RPC Error for method ${method}:`, data.error);
+        throw new SparkRequestError(`Bitcoin RPC error`, {
+          bitcoinRpcMethod: method,
+          params,
+          code: data.error.code,
+          error: data.error,
+        });
+      }
+
+      return data.result;
+    } catch (error) {
+      if (error instanceof SparkRequestError) {
+        throw error;
+      }
+      throw new SparkRequestError("Failed to call Bitcoin RPC", {
+        bitcoinRpcMethod: method,
+        params,
+        error,
+      });
+    }
+  }
+
+  async generateToAddress(numBlocks: number, address: string) {
+    return await this.call<string[]>("generatetoaddress", [numBlocks, address]);
+  }
+
+  async sendToAddressInternal(address: string, amountSats: number) {
+    return await this.call<string>("sendtoaddress", [
+      address,
+      amountSats / SATS_PER_BTC,
+    ]);
+  }
+
+  async getBlock(blockHash: string) {
+    return await this.call<unknown>("getblock", [blockHash, 2]);
+  }
+
+  async getBlockCount(): Promise<number> {
+    return await this.call<number>("getblockcount", []);
+  }
+
+  async waitForBlocksMined({
+    startBlock,
+    expectedIncrease,
+    timeoutMs = 30000,
+    intervalMs = 100,
+  }: {
+    startBlock: number;
+    expectedIncrease: number;
+    timeoutMs?: number;
+    intervalMs?: number;
+  }) {
+    const deadline = Date.now() + timeoutMs;
+    // Give some time for the blocks to be mined and the chain watcher to catch up.
+    await new Promise((r) => setTimeout(r, intervalMs));
+
+    const start = startBlock;
+    const target = start + expectedIncrease;
+    while (Date.now() < deadline) {
+      const currentBlock = await this.getBlockCount();
+      if (currentBlock >= target) return currentBlock;
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    throw new Error(
+      `Timed out waiting for ${expectedIncrease} blocks (target height ${target})`,
+    );
+  }
+
+  async broadcastTx(txHex: string) {
+    const response = await this.call<string>("sendrawtransaction", [txHex, 0]);
+    return response;
+  }
+
+  async submitPackage(txHexs: string[]) {
+    const response = await this.call<unknown>("submitpackage", [txHexs]);
+    return response;
+  }
+
+  async getNewAddress(): Promise<string> {
+    await Promise.resolve();
+    const key = secp256k1.utils.randomPrivateKey();
+    const pubKey = secp256k1.getPublicKey(key);
+    return getP2TRAddressFromPublicKey(pubKey, Network.LOCAL);
+  }
+
+  async getNewExternalWPKHWallet(): Promise<{
+    address: string;
+    key: Uint8Array;
+    pubKey: Uint8Array;
+  }> {
+    await Promise.resolve();
+    const key = secp256k1.utils.randomPrivateKey();
+    const pubKey = secp256k1.getPublicKey(key);
+    return {
+      address: getP2WPKHAddressFromPublicKey(pubKey, Network.LOCAL),
+      key,
+      pubKey,
+    };
+  }
+
+  async sendToAddress(
+    address: string,
+    amount: bigint,
+    blocksToGenerate: number = 1,
+  ): Promise<Transaction> {
+    const amountBtc = Number(amount) / SATS_PER_BTC;
+    const txid: string = await this.call("sendtoaddress", [address, amountBtc]);
+
+    if (blocksToGenerate > 0) {
+      const randomKey = secp256k1.utils.randomPrivateKey();
+      const randomPubKey = secp256k1.getPublicKey(randomKey);
+      const randomAddress = getP2TRAddressFromPublicKey(
+        randomPubKey,
+        Network.LOCAL,
+      );
+      await this.generateToAddress(blocksToGenerate, randomAddress);
+    }
+
+    const rawTx = await this.getRawTransaction(txid);
+    return Transaction.fromRaw(hexToBytes(rawTx.hex));
+  }
+
+  static findOutputIndex(tx: Transaction, script: Uint8Array): number {
+    for (let i = 0; i < tx.outputsLength; i++) {
+      const output = tx.getOutput(i);
+      if (
+        output.script &&
+        output.script.length === script.length &&
+        output.script.every((b, j) => b === script[j])
+      ) {
+        return i;
+      }
+    }
+    throw new Error("Output not found in transaction");
+  }
+
+  private async buildAndBroadcastTx(
+    coin: FaucetCoin,
+    address: string,
+    amount: bigint,
+    feeAmount: bigint = FEE_AMOUNT,
+  ): Promise<Transaction> {
+    const tx = new Transaction();
+    tx.addInput({ ...coin.outpoint, sequence: 0xfffffffd });
+
+    const availableAmount = COIN_AMOUNT - feeAmount;
+
+    const destinationAddress = Address(getNetwork(Network.LOCAL)).decode(
+      address,
+    );
+    const destinationScript = OutScript.encode(destinationAddress);
+    tx.addOutput({
+      script: destinationScript,
+      amount: amount,
+    });
+
+    const changeAmount = availableAmount - amount;
+    if (changeAmount > 0) {
+      const changeKey = secp256k1.utils.randomPrivateKey();
+      const changePubKey = secp256k1.getPublicKey(changeKey);
+      const changeScript = getP2TRScriptFromPublicKey(
+        changePubKey,
+        Network.LOCAL,
+      );
+      tx.addOutput({
+        script: changeScript,
+        amount: changeAmount,
+      });
+    }
+
+    const signedTx = await this.signFaucetCoin(tx, coin.txout, coin.key);
+    const txHex = bytesToHex(signedTx.extract());
+    await this.broadcastTx(txHex);
+
+    return signedTx;
+  }
+
+  async sendToAddressRbf(
+    address: string,
+    amount: bigint,
+  ): Promise<{ tx: Transaction; coin: FaucetCoin }> {
+    const coin = await this.fund();
+    if (!coin) {
+      throw new Error("No coins available");
+    }
+    const tx = await this.buildAndBroadcastTx(coin, address, amount);
+    return { tx, coin };
+  }
+
+  async replaceTransaction(
+    coin: FaucetCoin,
+    address: string,
+    amount: bigint,
+  ): Promise<Transaction> {
+    await Promise.resolve();
+    return this.buildAndBroadcastTx(coin, address, amount, FEE_AMOUNT * 2n);
+  }
+
+  async getRawTransaction(txid: string) {
+    return await this.call<RawTransactionInfo>("getrawtransaction", [txid, 2]);
+  }
+
+  async getRawMempool() {
+    return await this.call<string[]>("getrawmempool", []);
+  }
+
+  async getMempoolEntry(txid: string) {
+    return await this.call<unknown>("getmempoolentry", [txid]);
+  }
+
+  async waitForMempoolEntry(
+    txid: string,
+    timeoutMs: number = 30000,
+    intervalMs: number = 5000,
+  ) {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      try {
+        const mempoolEntry = await this.getMempoolEntry(txid);
+        if (mempoolEntry) {
+          return mempoolEntry;
+        }
+      } catch {
+        await new Promise((r) => setTimeout(r, intervalMs));
+      }
+    }
+    throw new Error(`Timed out waiting for mempool entry for txid ${txid}`);
+  }
+}

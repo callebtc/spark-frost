@@ -1,0 +1,23 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Generated JS artifacts
+node_modules/
+dist/
+.turbo/
+.pnp.*
+.yarn/*
+!.yarn/releases/
+!.yarn/releases/**
+!.yarn/plugins/
+!.yarn/plugins/**
+
+# Local wallet/demo state
+private/
+demo/state/
+*.log
+
+# Local upstream checkout used while extracting this fork.
+spark/

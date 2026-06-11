@@ -1,0 +1,1585 @@
+import { describe, expect, it, jest } from "@jest/globals";
+import { bytesToHex, equalBytes, hexToBytes } from "@noble/curves/utils";
+import { generateMnemonic } from "@scure/bip39";
+import { wordlist } from "@scure/bip39/wordlists/english";
+import { uuidv7 } from "uuidv7";
+import { SparkError } from "../../errors/index.js";
+import { SparkValidationError } from "../../errors/types.js";
+import { InvoiceStatus, TransferStatus } from "../../proto/spark.js";
+import type { LeafKeyTweak } from "../../services/transfer.js";
+import {
+  type ConfigOptions,
+  getLocalSigningOperators,
+} from "../../services/wallet-config.js";
+import { type KeyDerivation, KeyDerivationType } from "../../signer/types.js";
+import { SparkWalletEvent } from "../../spark-wallet/types.js";
+import { walletTypes } from "../test-utils.js";
+import {
+  SparkWalletTestingIntegration,
+  SparkWalletTestingIntegrationWithStream,
+} from "../utils/spark-testing-wallet.js";
+import { BitcoinFaucet } from "../utils/test-faucet.js";
+
+describe.each(walletTypes)(
+  "Transfer with name",
+  ({ name, Signer, createTree }) => {
+    jest.setTimeout(15_000);
+    it(`${name} - test transfer`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+
+      const { wallet: senderWallet } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          signer: new Signer(),
+        });
+
+      const senderTransferService = senderWallet.getTransferService();
+
+      const leafId = uuidv7();
+      const rootNode = await createTree(senderWallet, leafId, faucet, 1000n);
+
+      const newLeafDerivationPath: KeyDerivation = {
+        type: KeyDerivationType.LEAF,
+        path: uuidv7(),
+      };
+
+      const { wallet: receiverWallet } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          signer: new Signer(),
+        });
+      const receiverPubkey = await receiverWallet.getIdentityPublicKey();
+
+      const receiverTransferService = receiverWallet.getTransferService();
+
+      const transferNode: LeafKeyTweak = {
+        leaf: rootNode,
+        keyDerivation: {
+          type: KeyDerivationType.LEAF,
+          path: leafId,
+        },
+        newKeyDerivation: newLeafDerivationPath,
+        receiverIdentityPublicKey: hexToBytes(receiverPubkey),
+      };
+
+      const senderTransfer =
+        await senderTransferService.sendTransferWithKeyTweaks([transferNode]);
+
+      const pendingTransfer = await receiverWallet.queryPendingTransfers();
+
+      expect(pendingTransfer.transfers.length).toBe(1);
+
+      const receiverTransfer = pendingTransfer.transfers[0];
+
+      expect(receiverTransfer!.id).toBe(senderTransfer.id);
+
+      const leafPrivKeyMap = await receiverWallet.verifyPendingTransfer(
+        receiverTransfer!,
+      );
+
+      expect(leafPrivKeyMap.size).toBe(1);
+
+      const leafPrivKeyMapBytes = leafPrivKeyMap.get(rootNode.id);
+      expect(leafPrivKeyMapBytes).toBeDefined();
+      expect(bytesToHex(leafPrivKeyMapBytes!)).toBe(
+        bytesToHex(
+          await senderWallet
+            .getSigner()
+            .getPublicKeyFromDerivation(newLeafDerivationPath),
+        ),
+      );
+
+      await receiverTransferService.claimTransfer(receiverTransfer!);
+
+      const balance = await receiverWallet.getBalance();
+      expect(balance.balance).toBe(1000n);
+    }, 30000);
+
+    it(`${name} - test transfer with separate`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+      const { wallet: senderWallet } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          signer: new Signer(),
+        });
+
+      const senderTransferService = senderWallet.getTransferService();
+
+      const { wallet: receiverWallet } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          signer: new Signer(),
+        });
+      const receiverPubkey = await receiverWallet.getIdentityPublicKey();
+
+      const receiverTransferService = receiverWallet.getTransferService();
+
+      const leafId = uuidv7();
+      const rootNode = await createTree(senderWallet, leafId, faucet, 100_000n);
+
+      const newLeafDerivationPath: KeyDerivation = {
+        type: KeyDerivationType.LEAF,
+        path: uuidv7(),
+      };
+
+      const transferNode: LeafKeyTweak = {
+        leaf: rootNode,
+        keyDerivation: {
+          type: KeyDerivationType.LEAF,
+          path: leafId,
+        },
+        newKeyDerivation: newLeafDerivationPath,
+        receiverIdentityPublicKey: hexToBytes(receiverPubkey),
+      };
+
+      const leavesToTransfer = [transferNode];
+
+      const senderTransfer =
+        await senderTransferService.sendTransferWithKeyTweaks(leavesToTransfer);
+
+      // Receiver queries pending transfer
+      const pendingTransfer = await receiverWallet.queryPendingTransfers();
+
+      expect(pendingTransfer.transfers.length).toBe(1);
+
+      const receiverTransfer = pendingTransfer.transfers[0];
+
+      expect(receiverTransfer!.id).toBe(senderTransfer.id);
+
+      const leafPrivKeyMap = await receiverWallet.verifyPendingTransfer(
+        receiverTransfer!,
+      );
+
+      expect(leafPrivKeyMap.size).toBe(1);
+
+      const leafPrivKeyMapBytes = leafPrivKeyMap.get(rootNode.id);
+      expect(leafPrivKeyMapBytes).toBeDefined();
+      expect(
+        equalBytes(
+          leafPrivKeyMapBytes!,
+          await senderWallet
+            .getSigner()
+            .getPublicKeyFromDerivation(newLeafDerivationPath),
+        ),
+      ).toBe(true);
+
+      const claimingNodes: LeafKeyTweak[] = receiverTransfer!.leaves.map(
+        (leaf) => ({
+          leaf: {
+            ...leaf.leaf!,
+            refundTx: leaf.intermediateRefundTx,
+            directRefundTx: leaf.intermediateDirectRefundTx,
+            directFromCpfpRefundTx: leaf.intermediateDirectFromCpfpRefundTx,
+          },
+          keyDerivation: {
+            type: KeyDerivationType.ECIES,
+            path: leaf.secretCipher,
+          },
+          newKeyDerivation: {
+            type: KeyDerivationType.LEAF,
+            path: leaf.leaf!.id,
+          },
+          receiverIdentityPublicKey: hexToBytes(receiverPubkey),
+        }),
+      );
+
+      await receiverTransferService.claimTransferTweakKeys(
+        receiverTransfer!,
+        claimingNodes,
+      );
+
+      const newPendingTransfer = await receiverWallet.queryPendingTransfers();
+
+      expect(newPendingTransfer.transfers.length).toBe(1);
+
+      const newReceiverTransfer = newPendingTransfer.transfers[0];
+      expect(newReceiverTransfer!.id).toBe(receiverTransfer!.id);
+
+      const newLeafPubKeyMap = await receiverWallet.verifyPendingTransfer(
+        newReceiverTransfer!,
+      );
+
+      expect(newLeafPubKeyMap.size).toBe(1);
+
+      const newLeafPubKeyMapBytes = newLeafPubKeyMap.get(rootNode.id);
+      expect(newLeafPubKeyMapBytes).toBeDefined();
+      expect(bytesToHex(newLeafPubKeyMapBytes!)).toBe(
+        bytesToHex(
+          await senderWallet
+            .getSigner()
+            .getPublicKeyFromDerivation(newLeafDerivationPath),
+        ),
+      );
+
+      await receiverTransferService.claimTransferSignRefunds(
+        newReceiverTransfer!,
+        claimingNodes,
+      );
+
+      const newNewPendingTransfer =
+        await receiverWallet.queryPendingTransfers();
+      expect(newNewPendingTransfer.transfers.length).toBe(1);
+
+      await receiverTransferService.claimTransfer(
+        newNewPendingTransfer.transfers[0]!,
+      );
+    });
+
+    it(`${name} - test that a new wallet instance can claim a pending transfer`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+
+      const { wallet: senderWallet } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          signer: new Signer(),
+        });
+
+      const senderTransferService = senderWallet.getTransferService();
+
+      const leafId = uuidv7();
+      const rootNode = await createTree(senderWallet, leafId, faucet, 1000n);
+
+      const newLeafDerivationPath: KeyDerivation = {
+        type: KeyDerivationType.LEAF,
+        path: uuidv7(),
+      };
+
+      const mnemonic = generateMnemonic(wordlist);
+      const { wallet: receiverWallet } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          mnemonicOrSeed: mnemonic,
+          signer: new Signer(),
+        });
+
+      const receiverPubkey = await receiverWallet.getIdentityPublicKey();
+
+      const transferNode: LeafKeyTweak = {
+        leaf: rootNode,
+        keyDerivation: {
+          type: KeyDerivationType.LEAF,
+          path: leafId,
+        },
+        newKeyDerivation: newLeafDerivationPath,
+        receiverIdentityPublicKey: hexToBytes(receiverPubkey),
+      };
+
+      const senderTransfer =
+        await senderTransferService.sendTransferWithKeyTweaks([transferNode]);
+
+      // Create a new wallet instance from same mnemonic to simulate recovery
+      const { wallet: receiverWalletRecovered } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          mnemonicOrSeed: mnemonic,
+          signer: new Signer(),
+        });
+      const receiverTransferServiceRecovered =
+        receiverWalletRecovered.getTransferService();
+
+      const pendingTransfer =
+        await receiverWalletRecovered.queryPendingTransfers();
+
+      expect(pendingTransfer.transfers.length).toBe(1);
+
+      const receiverTransfer = pendingTransfer.transfers[0];
+
+      expect(receiverTransfer!.id).toBe(senderTransfer.id);
+
+      const leafPrivKeyMap =
+        await receiverWalletRecovered.verifyPendingTransfer(receiverTransfer!);
+
+      expect(leafPrivKeyMap.size).toBe(1);
+
+      await receiverTransferServiceRecovered.claimTransfer(receiverTransfer!);
+
+      const balance = await receiverWalletRecovered.getBalance();
+      expect(balance.balance).toBe(1000n);
+    });
+
+    it(`${name} - test incoming transfer rpc stream`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+
+      const { wallet: senderWallet } =
+        await SparkWalletTestingIntegration.initialize({
+          options,
+          signer: new Signer(),
+        });
+
+      const depositAddress = await senderWallet.getSingleUseDepositAddress();
+
+      const signedTx = await faucet.sendToAddress(depositAddress, 1_000n);
+
+      await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+      await senderWallet.claimDeposit(signedTx.id);
+
+      let resolveStreamConnected: () => void;
+      const streamConnectedPromise = new Promise<void>((resolve) => {
+        resolveStreamConnected = resolve;
+      });
+      const { wallet: receiverWallet } =
+        await SparkWalletTestingIntegrationWithStream.initialize({
+          options: {
+            ...options,
+            events: {
+              [SparkWalletEvent.StreamConnected]: () => {
+                resolveStreamConnected();
+              },
+            },
+          },
+        });
+      await streamConnectedPromise;
+
+      expect(await receiverWallet.getSparkAddress()).not.toEqual(
+        await senderWallet.getSparkAddress(),
+      );
+
+      const transfer = await senderWallet.transfer({
+        amountSats: 1000,
+        receiverSparkAddress: await receiverWallet.getSparkAddress(),
+      });
+
+      async function waitForTransferClaim(
+        transferId: string,
+        timeoutMs: number,
+      ): Promise<{ transferId: string; balance: bigint }> {
+        await Promise.resolve();
+        return new Promise((resolve, reject) => {
+          const timeout = setTimeout(() => {
+            receiverWallet.removeListener(
+              SparkWalletEvent.TransferClaimed,
+              handler,
+            );
+            reject(
+              new Error(
+                `Timeout waiting for transfer ${transferId} to be claimed`,
+              ),
+            );
+          }, timeoutMs);
+
+          const handler = (claimedTransferId: string, balance: bigint) => {
+            if (claimedTransferId === transferId) {
+              clearTimeout(timeout);
+              receiverWallet.removeListener(
+                SparkWalletEvent.TransferClaimed,
+                handler,
+              );
+              resolve({ transferId: claimedTransferId, balance });
+            }
+          };
+
+          receiverWallet.on(SparkWalletEvent.TransferClaimed, handler);
+        });
+      }
+
+      const result = await waitForTransferClaim(transfer.id, 10000);
+      expect(result.transferId).toBe(transfer.id);
+      expect(result.balance).toBe(1000n);
+      const receiverBalance = await receiverWallet.getBalance();
+      expect(receiverBalance.balance).toBe(1000n);
+    });
+
+    describe.skip("address validation", () => {
+      // it.concurrent.each(networkCombinations)(
+      //   "should not allow transfer from %s to %s network due to address validation",
+      //   async (sourceNetwork, targetNetwork) => {
+      //     const sourceOptions: ConfigOptions = {
+      //       network: sourceNetwork
+      //     };
+      //     const targetOptions: ConfigOptions = {
+      //       network: targetNetwork,
+      //     };
+      //     const { wallet: sourceWallet } = await SparkWalletTestingIntegration.initialize({
+      //       options: sourceOptions,
+      //     });
+      //     const { wallet: targetWallet } = await SparkWalletTestingIntegration.initialize({
+      //       options: targetOptions,
+      //     });
+      //     const targetAddress = await targetWallet.getSparkAddress();
+      //     await expect(
+      //       sourceWallet.transfer({
+      //         amountSats: 1000,
+      //         receiverSparkAddress: targetAddress,
+      //       }),
+      //     ).rejects.toThrow(
+      //       expect.objectContaining({
+      //         name: SparkValidationError.name,
+      //         message: expect.stringMatching(/Invalid Spark address prefix/),
+      //         context: expect.objectContaining({
+      //           field: "address",
+      //           value: targetAddress,
+      //         }),
+      //       }),
+      //     );
+      //   },
+      // );
+      // it.concurrent.each(networkTypes)(
+      //   "should fail transfer on same %s network due to no available leaves",
+      //   async (network) => {
+      //     const options: ConfigOptions = {
+      //       network,
+      //     };
+      //     const { wallet: wallet1 } = await SparkWalletTestingIntegration.initialize({
+      //       options,
+      //     });
+      //     const { wallet: wallet2 } = await SparkWalletTestingIntegration.initialize({
+      //       options,
+      //     });
+      //     const address2 = await wallet2.getSparkAddress();
+      //     await expect(
+      //       wallet1.transfer({
+      //         amountSats: 1000,
+      //         receiverSparkAddress: address2,
+      //       }),
+      //     ).rejects.toThrow(
+      //       expect.objectContaining({
+      //         name: SparkValidationError.name,
+      //         message: expect.stringMatching(/No owned leaves found/),
+      //       }),
+      //     );
+      //   },
+      // );
+    });
+  },
+);
+
+describe.each(walletTypes)("transfer v2", ({ name, Signer, createTree }) => {
+  jest.setTimeout(15_000);
+  it(`${name} - test transfer with pretweaked package`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+
+    const options: ConfigOptions = {
+      network: "LOCAL",
+    };
+
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+    const senderTransferService = senderWallet.getTransferService();
+
+    const leafId = uuidv7();
+    const rootNode = await createTree(senderWallet, leafId, faucet, 1000n);
+
+    const newLeafDerivationPath: KeyDerivation = {
+      type: KeyDerivationType.LEAF,
+      path: uuidv7(),
+    };
+
+    const { wallet: receiverWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+    const receiverPubkey = await receiverWallet.getIdentityPublicKey();
+    const receiverTransferService = receiverWallet.getTransferService();
+
+    const transferNode: LeafKeyTweak = {
+      leaf: rootNode,
+      keyDerivation: {
+        type: KeyDerivationType.LEAF,
+        path: leafId,
+      },
+      newKeyDerivation: newLeafDerivationPath,
+      receiverIdentityPublicKey: hexToBytes(receiverPubkey),
+    };
+
+    const senderTransfer =
+      await senderTransferService.sendTransferWithKeyTweaks([transferNode]);
+
+    const pendingTransfer = await receiverWallet.queryPendingTransfers();
+
+    expect(pendingTransfer.transfers.length).toBe(1);
+
+    const receiverTransfer = pendingTransfer.transfers[0];
+
+    expect(receiverTransfer!.id).toBe(senderTransfer.id);
+    expect(receiverTransfer!.expiryTime?.getTime() ?? 0).toBeLessThan(
+      Date.now(),
+    );
+
+    const leafPrivKeyMap = await receiverWallet.verifyPendingTransfer(
+      receiverTransfer!,
+    );
+
+    expect(leafPrivKeyMap.size).toBe(1);
+
+    const leafPrivKeyMapBytes = leafPrivKeyMap.get(rootNode.id);
+    expect(leafPrivKeyMapBytes).toBeDefined();
+    expect(bytesToHex(leafPrivKeyMapBytes!)).toBe(
+      bytesToHex(
+        await senderWallet
+          .getSigner()
+          .getPublicKeyFromDerivation(newLeafDerivationPath),
+      ),
+    );
+
+    await receiverTransferService.claimTransfer(receiverTransfer!);
+
+    const balance = await receiverWallet.getBalance();
+    expect(balance.balance).toBe(1000n);
+  }, 30000);
+
+  it(`${name} - test self transfer with pretweaked package`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+    const options: ConfigOptions = {
+      network: "LOCAL",
+    };
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+    const senderTransferService = senderWallet.getTransferService();
+    const leafId = uuidv7();
+    const rootNode = await createTree(senderWallet, leafId, faucet, 1000n);
+    const newLeafDerivationPath: KeyDerivation = {
+      type: KeyDerivationType.LEAF,
+      path: uuidv7(),
+    };
+    const receiverPubkey = await senderWallet.getIdentityPublicKey();
+    const transferNode: LeafKeyTweak = {
+      leaf: rootNode,
+      keyDerivation: {
+        type: KeyDerivationType.LEAF,
+        path: leafId,
+      },
+      newKeyDerivation: newLeafDerivationPath,
+      receiverIdentityPublicKey: hexToBytes(receiverPubkey),
+    };
+    const senderTransfer =
+      await senderTransferService.sendTransferWithKeyTweaks([transferNode]);
+    const receiverTransfer = await senderTransferService.queryTransfer(
+      senderTransfer.id,
+    );
+    expect(receiverTransfer!.id).toBe(senderTransfer.id);
+    expect(receiverTransfer!.expiryTime?.getTime() ?? 0).toBeLessThan(
+      Date.now(),
+    );
+
+    await senderTransferService.claimTransfer(receiverTransfer!);
+
+    const balance = await senderWallet.getBalance();
+    expect(balance.balance).toBe(1000n);
+  }, 30000);
+
+  it(`${name} - test transfer with wallet`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+
+    const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+      },
+      signer: new Signer(),
+    });
+
+    const depositResp = await sdk.getSingleUseDepositAddress();
+    if (!depositResp) {
+      throw new SparkError("Deposit address not found");
+    }
+
+    const signedTx = await faucet.sendToAddress(depositResp, 1_000n);
+
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+    await sdk.claimDeposit(signedTx.id);
+
+    const balance = await sdk.getBalance();
+    expect(balance.balance).toBe(1_000n);
+
+    const sparkAddress = await sdk.getSparkAddress();
+
+    await sdk.transfer({
+      amountSats: 1000,
+      receiverSparkAddress: sparkAddress,
+    });
+
+    const newPendingTransfer = await sdk.queryPendingTransfers();
+    expect(newPendingTransfer.transfers.length).toBe(0);
+    const newBalance = await sdk.getBalance();
+    expect(newBalance.balance).toBe(1000n);
+  });
+
+  it(`${name} - test transfer with retry`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+
+    const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+      },
+      signer: new Signer(),
+    });
+
+    const depositResp = await sdk.getSingleUseDepositAddress();
+    if (!depositResp) {
+      throw new SparkError("Deposit address not found");
+    }
+
+    const signedTx = await faucet.sendToAddress(depositResp, 1_000n);
+
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+    await sdk.claimDeposit(signedTx.id);
+
+    const balance = await sdk.getBalance();
+    expect(balance.balance).toBe(1_000n);
+
+    const { wallet: sdk2 } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+      },
+      signer: new Signer(),
+    });
+
+    await sdk.transfer({
+      amountSats: 1000,
+      receiverSparkAddress: await sdk2.getSparkAddress(),
+    });
+
+    const pendingTransfers = await sdk2.queryPendingTransfers();
+    expect(pendingTransfers.transfers.length).toBe(1);
+    const transfer = pendingTransfers.transfers[0]!;
+
+    const transferService = sdk2.getTransferService();
+    const originalClaimTransferCore =
+      transferService.claimTransferCore.bind(transferService);
+    const claimTransferCoreSpy = jest
+      .spyOn(transferService, "claimTransferCore")
+      .mockRejectedValueOnce(new Error("Network error"))
+      .mockImplementation(async (transfer) => {
+        return await originalClaimTransferCore(transfer);
+      });
+
+    await transferService.claimTransfer(transfer);
+
+    expect(claimTransferCoreSpy).toHaveBeenCalledTimes(2);
+    expect((await sdk2.getBalance()).balance).toBe(1000n);
+  });
+
+  it(`${name} - test claiming already claimed transfer`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+
+    const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+      },
+      signer: new Signer(),
+    });
+
+    const depositResp = await sdk.getSingleUseDepositAddress();
+
+    if (!depositResp) {
+      throw new SparkError("Deposit address not found");
+    }
+
+    const signedTx = await faucet.sendToAddress(depositResp, 1_000n);
+
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+    await sdk.claimDeposit(signedTx.id);
+
+    const balance = await sdk.getBalance();
+    expect(balance.balance).toBe(1_000n);
+
+    const { wallet: sdk2 } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+      },
+      signer: new Signer(),
+    });
+
+    await sdk.transfer({
+      amountSats: 1000,
+      receiverSparkAddress: await sdk2.getSparkAddress(),
+    });
+
+    const pendingTransfers = await sdk2.queryPendingTransfers();
+    expect(pendingTransfers.transfers.length).toBe(1);
+    const transfer = pendingTransfers.transfers[0]!;
+
+    const transferService = sdk2.getTransferService();
+    await transferService.claimTransfer(transfer);
+
+    const claimTransferCoreSpy = jest.spyOn(
+      transferService,
+      "claimTransferCore",
+    );
+
+    const claim1 = await transferService.claimTransfer(transfer);
+    expect(claim1.length).toBe(1);
+
+    const claim2 = await transferService.claimTransfer({
+      ...transfer,
+      status: TransferStatus.TRANSFER_STATUS_RECEIVER_KEY_TWEAKED,
+    });
+    expect(claim2.length).toBe(1);
+
+    const claim3 = await transferService.claimTransfer(transfer);
+
+    expect(claim3.length).toBe(1);
+
+    // Expect 3 because we call claimTransfer 3 times and we expect there to be 0 retries
+    expect(claimTransferCoreSpy).toHaveBeenCalledTimes(3);
+
+    const balanceAfterMultipleClaims = await sdk2.getBalance();
+    expect(balanceAfterMultipleClaims.balance).toBe(1000n);
+  });
+
+  it(`${name} - test claimTransfer succeeds in one attempt after claimTransferTweakKeys`, async () => {
+    // After claimTransferTweakKeys has stored the receiver's key tweaks on
+    // every SO (transitioning each to RECEIVER_KEY_TWEAKED), a subsequent
+    // claimTransfer must complete the 2PC against the already-anchored
+    // polynomial — *without* the server overriding the stored proofs with a
+    // fresh polynomial from the unified claim_package. With the server-side
+    // fix (RKT in the useStoredKeyTweaks=true set + no-override guard in
+    // persistCoordinatorClaimKeyTweak), the coordinator extracts proofs
+    // from leaf.KeyTweak, omits the encrypted package on the wire, and
+    // Phase 1 / Phase 2 advance every SO to RECEIVER_KEY_TWEAK_APPLIED in a
+    // single round-trip.
+    //
+    // Pre-fix this same sequence failed on attempt 1 with
+    // AbortedConcurrentClaimConflict (the override installed a different
+    // polynomial on the coordinator than peers had stored), triggering a
+    // withRetry round that rolled the cluster back to SKT and only then
+    // succeeded with fresh proofs on attempt 2. The retry-on-error path
+    // itself is covered by the `mockRejectedValueOnce("Network error")`
+    // test above; this test exists to pin down the no-retry-needed shape
+    // of the post-fix tweak-then-claim handoff.
+    const faucet = BitcoinFaucet.getInstance();
+
+    const options: ConfigOptions = {
+      network: "LOCAL",
+    };
+
+    const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+      options,
+      signer: new Signer(),
+    });
+
+    const depositResp = await sdk.getSingleUseDepositAddress();
+
+    if (!depositResp) {
+      throw new SparkError("Deposit address not found");
+    }
+
+    const signedTx = await faucet.sendToAddress(depositResp, 1_000n);
+
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+    await sdk.claimDeposit(signedTx.id);
+
+    const balance = await sdk.getBalance();
+    expect(balance.balance).toBe(1_000n);
+
+    const { wallet: sdk2 } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+      },
+      signer: new Signer(),
+    });
+
+    const receiverTransferService = sdk2.getTransferService();
+
+    await sdk.transfer({
+      amountSats: 1000,
+      receiverSparkAddress: await sdk2.getSparkAddress(),
+    });
+
+    const pendingTransfers = await sdk2.queryPendingTransfers();
+    expect(pendingTransfers.transfers.length).toBe(1);
+    const transfer = pendingTransfers.transfers[0]!;
+
+    const sdk2Pubkey = await sdk2.getIdentityPublicKey();
+    const leaves: LeafKeyTweak[] = transfer.leaves.map((leaf) => ({
+      leaf: {
+        ...leaf.leaf!,
+        refundTx: leaf.intermediateRefundTx,
+        directRefundTx: leaf.intermediateDirectRefundTx,
+        directFromCpfpRefundTx: leaf.intermediateDirectFromCpfpRefundTx,
+      },
+      keyDerivation: {
+        type: KeyDerivationType.ECIES,
+        path: leaf.secretCipher,
+      },
+      newKeyDerivation: {
+        type: KeyDerivationType.LEAF,
+        path: leaf.leaf!.id,
+      },
+      receiverIdentityPublicKey: hexToBytes(sdk2Pubkey),
+    }));
+
+    await receiverTransferService.claimTransferTweakKeys(transfer, leaves);
+
+    const claimTransferCoreSpy = jest.spyOn(
+      receiverTransferService,
+      "claimTransferCore",
+    );
+
+    const res = await receiverTransferService.claimTransfer(transfer);
+    expect(res.length).toBe(1);
+
+    expect(claimTransferCoreSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it(`${name} - transfer between two wallets that are using different coordinators`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+
+    const localOperators = Object.values(getLocalSigningOperators());
+    const { wallet: alice } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+        coordinatorIdentifier: localOperators[0]!.identifier,
+      },
+      signer: new Signer(),
+    });
+    const depositResp = await alice.getSingleUseDepositAddress();
+
+    if (!depositResp) {
+      throw new SparkError("Deposit address not found");
+    }
+
+    const signedTx = await faucet.sendToAddress(depositResp, 1_000n);
+
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+    await alice.claimDeposit(signedTx.id);
+
+    const balance = await alice.getBalance();
+    expect(balance.balance).toBe(1_000n);
+
+    const options: ConfigOptions = {
+      network: "LOCAL",
+      coordinatorIdentifier: localOperators[1]!.identifier,
+    };
+    const { wallet: bob } = await SparkWalletTestingIntegration.initialize({
+      options,
+      signer: new Signer(),
+    });
+
+    const bobTransferService = bob.getTransferService();
+    const sparkAddress = await bob.getSparkAddress();
+
+    await alice.transfer({
+      amountSats: 1000,
+      receiverSparkAddress: sparkAddress,
+    });
+
+    const pendingTransfers = await bob.queryPendingTransfers();
+    expect(pendingTransfers.transfers.length).toBe(1);
+    const transfer = pendingTransfers.transfers[0]!;
+
+    await bobTransferService.claimTransfer(transfer);
+  });
+
+  it(`${name} - test transfer with new spark address`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+
+    const localOperators = Object.values(getLocalSigningOperators());
+    const { wallet: alice } = await SparkWalletTestingIntegration.initialize({
+      options: {
+        network: "LOCAL",
+        coordinatorIdentifier: localOperators[0]!.identifier,
+      },
+      signer: new Signer(),
+    });
+    const depositResp = await alice.getSingleUseDepositAddress();
+
+    if (!depositResp) {
+      throw new SparkError("Deposit address not found");
+    }
+
+    const signedTx = await faucet.sendToAddress(depositResp, 1_000n);
+
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+    await alice.claimDeposit(signedTx.id);
+
+    const balance = await alice.getBalance();
+    expect(balance.balance).toBe(1_000n);
+
+    const options: ConfigOptions = {
+      network: "LOCAL",
+      coordinatorIdentifier: localOperators[1]!.identifier,
+    };
+    const { wallet: bob } = await SparkWalletTestingIntegration.initialize({
+      options,
+      mnemonicOrSeed: generateMnemonic(wordlist),
+      signer: new Signer(),
+    });
+
+    const bobTransferService = bob.getTransferService();
+
+    await alice.transfer({
+      amountSats: 1000,
+      receiverSparkAddress: await bob.getSparkAddress(),
+    });
+
+    const pendingTransfers = await bob.queryPendingTransfers();
+    expect(pendingTransfers.transfers.length).toBe(1);
+    const transfer = pendingTransfers.transfers[0]!;
+
+    await bobTransferService.claimTransfer(transfer);
+  });
+});
+
+describe.each(walletTypes)(
+  "fulfill spark invoice",
+  ({ name, Signer, createTree }) => {
+    jest.setTimeout(25_000);
+
+    it(`${name} - test multiple valid transfers with invoice and nil amount invoice`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+
+      const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+      const depositAddrOne = await sdk.getSingleUseDepositAddress();
+      if (!depositAddrOne) {
+        throw new SparkError("Deposit address not found");
+      }
+      const depositAddrTwo = await sdk.getSingleUseDepositAddress();
+      if (!depositAddrTwo) {
+        throw new SparkError("Deposit address not found");
+      }
+      const depositAddrThree = await sdk.getSingleUseDepositAddress();
+      if (!depositAddrThree) {
+        throw new SparkError("Deposit address not found");
+      }
+
+      const oneThousand = await faucet.sendToAddress(depositAddrOne, 1_000n);
+      const twoThousand = await faucet.sendToAddress(depositAddrTwo, 2_000n);
+      const threeThousand = await faucet.sendToAddress(
+        depositAddrThree,
+        3_000n,
+      );
+
+      await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+      await sdk.claimDeposit(oneThousand.id);
+      await sdk.claimDeposit(twoThousand.id);
+      await sdk.claimDeposit(threeThousand.id);
+
+      const balance = await sdk.getBalance();
+      expect(balance.balance).toBe(6_000n);
+
+      const { wallet: sdk2 } = await SparkWalletTestingIntegration.initialize({
+        options: {
+          network: "LOCAL",
+        },
+        signer: new Signer(),
+      });
+
+      const receiverTransferService = sdk2.getTransferService();
+      const tomorrow = new Date(Date.now() + 1000 * 60 * 60 * 24);
+      const invoice1000 = await sdk2.createSatsInvoice({
+        amount: 1_000,
+        memo: "Test invoice",
+        expiryTime: tomorrow,
+      });
+      const invoice2000 = await sdk2.createSatsInvoice({
+        amount: 2_000,
+        memo: "Test invoice",
+        expiryTime: tomorrow,
+      });
+      const invoiceNilAmount = await sdk2.createSatsInvoice({
+        memo: "Test invoice",
+        expiryTime: tomorrow,
+      });
+
+      const transferResults = await sdk.fulfillSparkInvoice([
+        { invoice: invoice1000 },
+        { invoice: invoice2000 },
+        { invoice: invoiceNilAmount, amount: 3_000n },
+      ]);
+
+      const { satsTransactionSuccess, satsTransactionErrors } = transferResults;
+      expect(satsTransactionSuccess.length).toBe(3);
+      expect(satsTransactionErrors.length).toBe(0);
+
+      const pendingTransfers = await sdk2.queryPendingTransfers();
+      expect(pendingTransfers.transfers.length).toBe(3);
+
+      const sdk2Pubkey = hexToBytes(await sdk2.getIdentityPublicKey());
+      for (const transfer of pendingTransfers.transfers) {
+        const leaves: LeafKeyTweak[] = transfer.leaves.map((leaf) => ({
+          leaf: {
+            ...leaf.leaf!,
+            refundTx: leaf.intermediateRefundTx,
+            directRefundTx: leaf.intermediateDirectRefundTx,
+            directFromCpfpRefundTx: leaf.intermediateDirectFromCpfpRefundTx,
+          },
+          keyDerivation: {
+            type: KeyDerivationType.ECIES,
+            path: leaf.secretCipher,
+          },
+          newKeyDerivation: {
+            type: KeyDerivationType.LEAF,
+            path: leaf.leaf!.id,
+          },
+          receiverIdentityPublicKey: sdk2Pubkey,
+        }));
+        await receiverTransferService.claimTransferTweakKeys(transfer, leaves);
+        const beforeClaimBalance = await sdk2.getBalance();
+
+        const res = await receiverTransferService.claimTransfer(transfer);
+        expect(res.length).toBe(1);
+
+        const newBalance = await sdk2.getBalance();
+        expect(newBalance.balance).toBe(
+          beforeClaimBalance.balance + BigInt(transfer.totalValue),
+        );
+      }
+
+      const res = await sdk2.querySparkInvoices([
+        invoice1000,
+        invoice2000,
+        invoiceNilAmount,
+      ]);
+      expect(res.invoiceStatuses.length).toBe(3);
+      const [invoice1000Status, invoice2000Status, invoiceNilAmountStatus] =
+        res.invoiceStatuses;
+      expect(invoice1000Status?.invoice).toBe(invoice1000);
+      expect(invoice2000Status?.invoice).toBe(invoice2000);
+      expect(invoiceNilAmountStatus?.invoice).toBe(invoiceNilAmount);
+      expect(invoice1000Status?.status).toBe(InvoiceStatus.FINALIZED);
+      expect(invoice2000Status?.status).toBe(InvoiceStatus.FINALIZED);
+      expect(invoiceNilAmountStatus?.status).toBe(InvoiceStatus.FINALIZED);
+    });
+
+    it(`${name} - should reject invalid invoice: mismatched sender`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+
+      const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+      const depositAddr = await sdk.getSingleUseDepositAddress();
+      if (!depositAddr) {
+        throw new SparkError("Deposit address not found");
+      }
+
+      const oneThousand = await faucet.sendToAddress(depositAddr, 1_000n);
+
+      await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+      await sdk.claimDeposit(oneThousand.id);
+      const balance = await sdk.getBalance();
+      expect(balance.balance).toBe(1_000n);
+
+      const { wallet: sdk2 } = await SparkWalletTestingIntegration.initialize({
+        options: {
+          network: "LOCAL",
+        },
+        signer: new Signer(),
+      });
+
+      const tomorrow = new Date(Date.now() + 1000 * 60 * 60 * 24);
+      const invoice1000 = await sdk2.createSatsInvoice({
+        amount: 1_000,
+        memo: "Test invoice",
+        expiryTime: tomorrow,
+        senderSparkAddress: await sdk2.getSparkAddress(), // invalid sender public key - receiver as sender
+      });
+
+      const transferResults = await sdk.fulfillSparkInvoice([
+        { invoice: invoice1000 },
+      ]);
+      const { invalidInvoices } = transferResults;
+      expect(invalidInvoices.length).toBe(1);
+    });
+
+    it(`${name} - should reject invalid invoice: expired invoice`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+
+      const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+      const depositAddr = await sdk.getSingleUseDepositAddress();
+      if (!depositAddr) {
+        throw new SparkError("Deposit address not found");
+      }
+
+      const oneThousand = await faucet.sendToAddress(depositAddr, 1_000n);
+
+      await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+      await sdk.claimDeposit(oneThousand.id);
+      const balance = await sdk.getBalance();
+      expect(balance.balance).toBe(1_000n);
+
+      const yesterday = new Date(Date.now() - 1000 * 60 * 60 * 24);
+      const invoice1000 = await sdk.createSatsInvoice({
+        // invalid receiver public key - sdk as receiver
+        amount: 1_000,
+        memo: "Test invoice",
+        expiryTime: yesterday,
+        senderSparkAddress: await sdk.getSparkAddress(),
+      });
+
+      const transferResults = await sdk.fulfillSparkInvoice([
+        { invoice: invoice1000 },
+      ]);
+      const { invalidInvoices } = transferResults;
+      expect(invalidInvoices.length).toBe(1);
+    });
+
+    it(`${name} - should error when paying the same invoice twice`, async () => {
+      const faucet = BitcoinFaucet.getInstance();
+
+      const options: ConfigOptions = {
+        network: "LOCAL",
+      };
+
+      const { wallet: sdk } = await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+      const depositAddr = await sdk.getSingleUseDepositAddress();
+      if (!depositAddr) {
+        throw new SparkError("Deposit address not found");
+      }
+      const depositAddrTwo = await sdk.getSingleUseDepositAddress();
+      if (!depositAddrTwo) {
+        throw new SparkError("Deposit address not found");
+      }
+
+      const deposit = await faucet.sendToAddress(depositAddr, 1_000n);
+      const depositTwo = await faucet.sendToAddress(depositAddrTwo, 1_000n);
+
+      await faucet.mineBlocksAndWaitForMiningToComplete(3);
+
+      await sdk.claimDeposit(deposit.id);
+      await sdk.claimDeposit(depositTwo.id);
+
+      const balance = await sdk.getBalance();
+      expect(balance.balance).toBe(2_000n);
+
+      const { wallet: sdk2 } = await SparkWalletTestingIntegration.initialize({
+        options: {
+          network: "LOCAL",
+        },
+        signer: new Signer(),
+      });
+
+      const tomorrow = new Date(Date.now() + 1000 * 60 * 60 * 24);
+      const invoice1000 = await sdk2.createSatsInvoice({
+        amount: 1_000,
+        memo: "Test invoice",
+        expiryTime: tomorrow,
+        senderSparkAddress: await sdk.getSparkAddress(),
+      });
+
+      await sdk.fulfillSparkInvoice([{ invoice: invoice1000 }]);
+
+      const secondAttempt = await sdk.fulfillSparkInvoice([
+        { invoice: invoice1000 },
+      ]);
+      const { satsTransactionErrors } = secondAttempt;
+      expect(satsTransactionErrors.length).toBe(1);
+    });
+  },
+);
+
+describe.each(walletTypes)("transferV2 multi-receiver", ({ name, Signer }) => {
+  jest.setTimeout(120_000);
+
+  it(`${name} - transferV2 with 2 receivers`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+    const options: ConfigOptions = { network: "LOCAL" };
+
+    // Create sender and fund with 2 deposits (1000 sats each)
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    const depositAddr1 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx1 = await faucet.sendToAddress(depositAddr1, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx1.id);
+
+    const depositAddr2 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx2 = await faucet.sendToAddress(depositAddr2, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx2.id);
+
+    const senderBalance = await senderWallet.getBalance();
+    expect(senderBalance.balance).toBe(2_000n);
+
+    // Create 2 receiver wallets
+    const { wallet: receiver1 } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+    const { wallet: receiver2 } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    const sparkAddr1 = await receiver1.getSparkAddress();
+    const sparkAddr2 = await receiver2.getSparkAddress();
+
+    // Send multi-receiver transfer
+    const transfer = await senderWallet.transferV2({
+      receivers: [
+        { receiverSparkAddress: sparkAddr1, amountSats: 1000 },
+        { receiverSparkAddress: sparkAddr2, amountSats: 1000 },
+      ],
+    });
+    expect(transfer.id).toBeDefined();
+
+    // After send, transfer should be SENDER_KEY_TWEAKED.
+    // Requires MIMO knobs enabled on SOs.
+    expect(transfer.status).toBe("TRANSFER_STATUS_SENDER_KEY_TWEAKED");
+
+    // Verify sender balance is 0
+    const senderBalanceAfter = await senderWallet.getBalance();
+    expect(senderBalanceAfter.balance).toBe(0n);
+
+    // Receiver 1 claims
+    const pending1 = await receiver1.queryPendingTransfers();
+    expect(pending1.transfers.length).toBe(1);
+    expect(pending1.transfers[0]!.status).toBe(
+      TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAKED,
+    );
+    const r1TransferService = receiver1.getTransferService();
+    await r1TransferService.claimTransfer(pending1.transfers[0]!);
+    const balance1 = await receiver1.getBalance();
+    expect(balance1.balance).toBe(1_000n);
+
+    // After receiver 1 claims, receiver 2 should still see the transfer as
+    // pending (not COMPLETED) because receiver 2 hasn't claimed yet.
+    const pending2 = await receiver2.queryPendingTransfers();
+    expect(pending2.transfers.length).toBe(1);
+    expect(pending2.transfers[0]!.status).not.toBe(
+      TransferStatus.TRANSFER_STATUS_COMPLETED,
+    );
+
+    // Receiver 2 claims
+    const r2TransferService = receiver2.getTransferService();
+    await r2TransferService.claimTransfer(pending2.transfers[0]!);
+    const balance2 = await receiver2.getBalance();
+    expect(balance2.balance).toBe(1_000n);
+
+    // After both receivers claim, the transfer should be completed (no longer pending).
+    const final1 = await receiver1.queryPendingTransfers();
+    expect(final1.transfers.length).toBe(0);
+    const final2 = await receiver2.queryPendingTransfers();
+    expect(final2.transfers.length).toBe(0);
+  });
+
+  it(`${name} - transferV2 with single receiver`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+    const options: ConfigOptions = { network: "LOCAL" };
+
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    const depositAddr = await senderWallet.getSingleUseDepositAddress();
+    const signedTx = await faucet.sendToAddress(depositAddr, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx.id);
+
+    const { wallet: receiverWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+    const receiverAddr = await receiverWallet.getSparkAddress();
+
+    const transfer = await senderWallet.transferV2({
+      receivers: [{ receiverSparkAddress: receiverAddr, amountSats: 1000 }],
+    });
+    expect(transfer.id).toBeDefined();
+
+    const senderBalanceAfter = await senderWallet.getBalance();
+    expect(senderBalanceAfter.balance).toBe(0n);
+
+    const pending = await receiverWallet.queryPendingTransfers();
+    expect(pending.transfers.length).toBe(1);
+    const transferService = receiverWallet.getTransferService();
+    await transferService.claimTransfer(pending.transfers[0]!);
+    const receiverBalance = await receiverWallet.getBalance();
+    expect(receiverBalance.balance).toBe(1_000n);
+  });
+
+  it(`${name} - transferV2 receivers claim in reverse order`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+    const options: ConfigOptions = { network: "LOCAL" };
+
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    // Fund sender with 2 leaves
+    const depositAddr1 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx1 = await faucet.sendToAddress(depositAddr1, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx1.id);
+
+    const depositAddr2 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx2 = await faucet.sendToAddress(depositAddr2, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx2.id);
+
+    const { wallet: receiver1 } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+    const { wallet: receiver2 } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    await senderWallet.transferV2({
+      receivers: [
+        {
+          receiverSparkAddress: await receiver1.getSparkAddress(),
+          amountSats: 1000,
+        },
+        {
+          receiverSparkAddress: await receiver2.getSparkAddress(),
+          amountSats: 1000,
+        },
+      ],
+    });
+
+    // Receiver 2 claims FIRST
+    const pending2 = await receiver2.queryPendingTransfers();
+    expect(pending2.transfers.length).toBe(1);
+    expect(pending2.transfers[0]!.status).toBe(
+      TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAKED,
+    );
+    const r2Service = receiver2.getTransferService();
+    await r2Service.claimTransfer(pending2.transfers[0]!);
+    expect((await receiver2.getBalance()).balance).toBe(1_000n);
+
+    // After receiver 2 claims, transfer is still pending (not COMPLETED) for receiver 1.
+    const pending1 = await receiver1.queryPendingTransfers();
+    expect(pending1.transfers.length).toBe(1);
+    expect(pending1.transfers[0]!.status).not.toBe(
+      TransferStatus.TRANSFER_STATUS_COMPLETED,
+    );
+
+    // Receiver 1 claims SECOND — should still work
+    const r1Service = receiver1.getTransferService();
+    await r1Service.claimTransfer(pending1.transfers[0]!);
+    expect((await receiver1.getBalance()).balance).toBe(1_000n);
+
+    // Sender fully drained
+    expect((await senderWallet.getBalance()).balance).toBe(0n);
+
+    // After both receivers claim, the transfer should be completed (no longer pending).
+    const finalPending1 = await receiver1.queryPendingTransfers();
+    expect(finalPending1.transfers.length).toBe(0);
+    const finalPending2 = await receiver2.queryPendingTransfers();
+    expect(finalPending2.transfers.length).toBe(0);
+  });
+
+  it(`${name} - transferV2 with duplicate receiver addresses`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+    const options: ConfigOptions = { network: "LOCAL" };
+
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    // Fund sender with 2 deposits that match the target amounts exactly
+    // (avoids needing a leaves swap, which requires SSP — not available in hermetic tests)
+    const depositAddr1 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx1 = await faucet.sendToAddress(depositAddr1, 500n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx1.id);
+
+    const depositAddr2 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx2 = await faucet.sendToAddress(depositAddr2, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx2.id);
+
+    const senderBalance = await senderWallet.getBalance();
+    expect(senderBalance.balance).toBe(1_500n);
+
+    // Create ONE receiver wallet
+    const { wallet: receiverWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+    const sparkAddr = await receiverWallet.getSparkAddress();
+
+    // Send to the same address twice with different amounts
+    const transfer = await senderWallet.transferV2({
+      receivers: [
+        { receiverSparkAddress: sparkAddr, amountSats: 500 },
+        { receiverSparkAddress: sparkAddr, amountSats: 1_000 },
+      ],
+    });
+    expect(transfer.id).toBeDefined();
+
+    // Verify sender balance is 0
+    const senderBalanceAfter = await senderWallet.getBalance();
+    expect(senderBalanceAfter.balance).toBe(0n);
+
+    // Receiver claims
+    const pending = await receiverWallet.queryPendingTransfers();
+    expect(pending.transfers.length).toBe(1);
+    const transferService = receiverWallet.getTransferService();
+    await transferService.claimTransfer(pending.transfers[0]!);
+    const receiverBalance = await receiverWallet.getBalance();
+    expect(receiverBalance.balance).toBe(1_500n);
+  });
+
+  it(`${name} - transferV2 with empty receivers rejects`, async () => {
+    const options: ConfigOptions = { network: "LOCAL" };
+
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    await expect(senderWallet.transferV2({ receivers: [] })).rejects.toThrow(
+      SparkValidationError,
+    );
+  });
+
+  it(`${name} - transferV2 with self as one of the receivers auto-claims`, async () => {
+    const faucet = BitcoinFaucet.getInstance();
+    const options: ConfigOptions = { network: "LOCAL" };
+
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    // Fund sender with 2 deposits. Each target amount equals a full deposit
+    // so leaf selection assigns one deposit's leaves per receiver without
+    // needing a swap via SSP (unavailable in hermetic CI).
+    const depositAddr1 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx1 = await faucet.sendToAddress(depositAddr1, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx1.id);
+
+    const depositAddr2 = await senderWallet.getSingleUseDepositAddress();
+    const signedTx2 = await faucet.sendToAddress(depositAddr2, 1_000n);
+    await faucet.mineBlocksAndWaitForMiningToComplete(3);
+    await senderWallet.claimDeposit(signedTx2.id);
+
+    const senderBalance = await senderWallet.getBalance();
+    expect(senderBalance.balance).toBe(2_000n);
+
+    // Create a separate receiver
+    const { wallet: otherReceiver } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    const selfAddr = await senderWallet.getSparkAddress();
+    const otherAddr = await otherReceiver.getSparkAddress();
+
+    // Send to self AND another receiver in one V2 transfer.
+    // Before the fix, the self-bound portion would not auto-claim because
+    // the stream handler skips claim when sender == primary receiver.
+    const transfer = await senderWallet.transferV2({
+      receivers: [
+        { receiverSparkAddress: selfAddr, amountSats: 1000 },
+        { receiverSparkAddress: otherAddr, amountSats: 1000 },
+      ],
+    });
+    expect(transfer.id).toBeDefined();
+
+    // Both 1000-sat leaves transferred; self-receiver leaf claimed inline.
+    const senderBalanceAfter = await senderWallet.getBalance();
+    expect(senderBalanceAfter.balance).toBe(1_000n);
+
+    // Other receiver claims their portion
+    const pending = await otherReceiver.queryPendingTransfers();
+    expect(pending.transfers.length).toBe(1);
+    const otherTransferService = otherReceiver.getTransferService();
+    await otherTransferService.claimTransfer(pending.transfers[0]!);
+    const otherBalance = await otherReceiver.getBalance();
+    expect(otherBalance.balance).toBe(1_000n);
+
+    // No pending transfers remain for either party
+    const senderPending = await senderWallet.queryPendingTransfers();
+    expect(senderPending.transfers.length).toBe(0);
+    const otherPending = await otherReceiver.queryPendingTransfers();
+    expect(otherPending.transfers.length).toBe(0);
+  });
+
+  it(`${name} - transferV2 rejects spark invoice as receiver address`, async () => {
+    const options: ConfigOptions = { network: "LOCAL" };
+
+    const { wallet: receiverWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    const invoiceAddress = await receiverWallet.createSatsInvoice({
+      amount: 1000,
+    });
+
+    const { wallet: senderWallet } =
+      await SparkWalletTestingIntegration.initialize({
+        options,
+        signer: new Signer(),
+      });
+
+    await expect(
+      senderWallet.transferV2({
+        receivers: [{ receiverSparkAddress: invoiceAddress, amountSats: 1000 }],
+      }),
+    ).rejects.toThrow(SparkValidationError);
+  });
+});

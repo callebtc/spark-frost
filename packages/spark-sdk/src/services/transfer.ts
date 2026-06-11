@@ -1,0 +1,2507 @@
+import type { Logger } from "@lightsparkdev/core";
+import { secp256k1 } from "@noble/curves/secp256k1";
+import { equalBytes, hexToBytes } from "@noble/curves/utils";
+import { sha256 } from "@noble/hashes/sha2";
+import { type Transaction } from "@scure/btc-signer";
+import { type TransactionOutput } from "@scure/btc-signer/psbt";
+import { ClientError, Status } from "nice-grpc-common";
+import { uuidv7 } from "uuidv7";
+import {
+  SparkError,
+  SparkRequestError,
+  SparkValidationError,
+} from "../errors/index.js";
+import { SignatureIntent } from "../proto/common.js";
+import {
+  type ClaimLeafKeyTweak,
+  ClaimLeafKeyTweaks,
+  type ClaimPackage,
+  type ClaimTransferResponse,
+  type ClaimTransferSignRefundsResponse,
+  type CounterLeafSwapResponse,
+  type DeepPartial,
+  HashVariant,
+  type InitiateSwapPrimaryTransferResponse,
+  type LeafRefundTxSigningJob,
+  type LeafRefundTxSigningResult,
+  type NodeSignatures,
+  type QueryTransfersResponse,
+  type RenewNodeZeroTimelockSigningJob,
+  type RenewRefundTimelockSigningJob,
+  type SendLeafKeyTweak,
+  SendLeafKeyTweaks,
+  type StartTransferRequest,
+  type StartTransferResponse,
+  type Transfer,
+  type TransferFilter,
+  TransferPackage,
+  TransferStatus,
+  TransferType,
+  type TreeNode,
+} from "../proto/spark.js";
+import {
+  type KeyDerivation,
+  KeyDerivationType,
+  type SigningCommitmentWithOptionalNonce,
+} from "../signer/types.js";
+import { getSparkFrost } from "../spark-bindings/spark-bindings.js";
+import { type SparkAddressFormat } from "../utils/address.js";
+import {
+  getSigHashFromMultiInputTx,
+  getSigHashFromTx,
+  getTxFromRawTxBytes,
+} from "../utils/bitcoin.js";
+import { optionsWithIdempotencyKey } from "../utils/idempotency.js";
+import {
+  LoggingService,
+  type LogServiceDisplayName,
+} from "../utils/logging-service.js";
+import { NetworkToProto } from "../utils/network.js";
+import { type RetryContext, withRetry } from "../utils/retry.js";
+import { type VerifiableSecretShare } from "../utils/secret-sharing.js";
+import {
+  createCurrentTimelockRefundTxs,
+  createDecrementedTimelockNodeTx,
+  createDecrementedTimelockRefundTxs,
+  createInitialTimelockNodeTx,
+  createInitialTimelockRefundTxs,
+  createZeroTimelockNodeTx,
+  getCurrentTimelock,
+} from "../utils/transaction.js";
+import {
+  getClaimPackageSigningPayload,
+  getTransferPackageSigningPayload,
+} from "../utils/transfer_package.js";
+import { type WalletConfigService } from "./config.js";
+import { type ConnectionManager } from "./connection/connection.js";
+import {
+  type SigningService,
+  type UserSignedTxSigningJobWithSelfCommitment,
+} from "./signing.js";
+
+const DEFAULT_V3_TRANSFER_EXPIRY_MS = 24 * 60 * 60 * 1000;
+
+// Transfer statuses before the sender key tweak is applied — the sender
+// still owns the leaves in these states.
+export const SENDER_PENDING_STATUSES = [
+  TransferStatus.TRANSFER_STATUS_SENDER_INITIATED,
+  TransferStatus.TRANSFER_STATUS_SENDER_INITIATED_COORDINATOR,
+  TransferStatus.TRANSFER_STATUS_APPLYING_SENDER_KEY_TWEAK,
+  TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAK_PENDING,
+];
+
+// Counter-swap statuses covering the full lifecycle until completion.
+export const ACTIVE_COUNTER_SWAP_STATUSES = [
+  ...SENDER_PENDING_STATUSES,
+  TransferStatus.TRANSFER_STATUS_SENDER_KEY_TWEAKED,
+  TransferStatus.TRANSFER_STATUS_RECEIVER_KEY_TWEAK_LOCKED,
+  TransferStatus.TRANSFER_STATUS_RECEIVER_KEY_TWEAK_APPLIED,
+  TransferStatus.TRANSFER_STATUS_RECEIVER_KEY_TWEAKED,
+  TransferStatus.TRANSFER_STATUS_RECEIVER_REFUND_SIGNED,
+];
+
+export const PRIMARY_SWAP_TYPES = [
+  TransferType.PRIMARY_SWAP_V3,
+  TransferType.SWAP,
+];
+
+export const COUNTER_SWAP_TYPES = [
+  TransferType.COUNTER_SWAP_V3,
+  TransferType.COUNTER_SWAP,
+];
+
+export const OUTGOING_TRANSFER_TYPES = [
+  TransferType.COOPERATIVE_EXIT,
+  TransferType.UTXO_SWAP,
+  TransferType.PREIMAGE_SWAP,
+  TransferType.TRANSFER,
+];
+
+export type TransferQueryOptions = {
+  limit: number;
+  offset: number;
+  createdAfter?: Date;
+  createdBefore?: Date;
+};
+
+export const PENDING_TRANSFERS_BATCH_SIZE = 25;
+
+export type PendingTransferQueryOptions = {
+  transferIds?: string[];
+  limit?: number;
+  offset?: number;
+  createdAfter?: Date;
+  createdBefore?: Date;
+};
+
+type TransferPackageCommitmentsOverride = {
+  leavesToSend: UserSignedTxSigningJobWithSelfCommitment[];
+  directLeavesToSend: UserSignedTxSigningJobWithSelfCommitment[];
+  directFromCpfpLeavesToSend: UserSignedTxSigningJobWithSelfCommitment[];
+};
+
+export type TransferPackageWithSelfCommitments = Omit<
+  TransferPackage,
+  keyof TransferPackageCommitmentsOverride
+> &
+  TransferPackageCommitmentsOverride;
+
+export type LeafKeyTweak = {
+  leaf: TreeNode;
+  keyDerivation: KeyDerivation;
+  newKeyDerivation: KeyDerivation;
+  receiverIdentityPublicKey: Uint8Array;
+};
+
+export type ClaimLeafData = {
+  keyDerivation: KeyDerivation;
+  tx?: Transaction;
+  refundTx?: Transaction;
+  signingNonceCommitment: SigningCommitmentWithOptionalNonce;
+  vout?: number;
+};
+
+export type LeafRefundSigningData = {
+  keyDerivation: KeyDerivation;
+  receivingPubkey: Uint8Array;
+  signingNonceCommitment: SigningCommitmentWithOptionalNonce;
+  directSigningNonceCommitment: SigningCommitmentWithOptionalNonce;
+  tx: Transaction;
+  directTx?: Transaction;
+  refundTx?: Transaction;
+  directRefundTx?: Transaction;
+  directFromCpfpRefundTx?: Transaction;
+  directFromCpfpRefundSigningNonceCommitment: SigningCommitmentWithOptionalNonce;
+  vout: number;
+  connectorPrevOutput?: TransactionOutput;
+};
+
+export type SigningJobType =
+  | "split"
+  | "directSplit"
+  | "node"
+  | "directNode"
+  | "cpfp"
+  | "direct"
+  | "directFromCpfp";
+
+export type SigningJobWithOptionalNonce = {
+  signingPublicKey: Uint8Array;
+  rawTx: Uint8Array;
+  signingNonceCommitment: SigningCommitmentWithOptionalNonce;
+  type: SigningJobType;
+  parentTxOut: TransactionOutput;
+  leafId: string;
+  keyDerivation: KeyDerivation;
+  verifyingKey: Uint8Array;
+};
+
+export class BaseTransferService {
+  protected readonly config: WalletConfigService;
+  protected readonly connectionManager: ConnectionManager;
+  protected readonly signingService: SigningService;
+  protected readonly logger: Logger;
+
+  protected destroyed = false;
+
+  constructor(
+    config: WalletConfigService,
+    connectionManager: ConnectionManager,
+    signingService: SigningService,
+    logging = LoggingService.fromConfig(config),
+    serviceName: LogServiceDisplayName = "TransferService",
+  ) {
+    this.config = config;
+    this.connectionManager = connectionManager;
+    this.signingService = signingService;
+    this.logger = logging.logger(serviceName);
+  }
+
+  cleanup() {
+    this.destroyed = true;
+  }
+
+  protected assertNotDestroyed(
+    message: string,
+  ): asserts this is { destroyed: false } {
+    if (this.destroyed) {
+      throw new SparkError(message);
+    }
+  }
+
+  async deliverTransferPackage(
+    transfer: Transfer,
+    leaves: LeafKeyTweak[],
+    cpfpRefundSignatureMap: Map<string, Uint8Array>,
+    directRefundSignatureMap: Map<string, Uint8Array>,
+    directFromCpfpRefundSignatureMap: Map<string, Uint8Array>,
+  ): Promise<Transfer> {
+    const keyTweakInputMap = await this.prepareSendTransferKeyTweaks(
+      transfer.id,
+      leaves,
+      cpfpRefundSignatureMap,
+      directRefundSignatureMap,
+      directFromCpfpRefundSignatureMap,
+    );
+
+    for (const key of Object.keys(this.config.getSigningOperators())) {
+      const tweaks = keyTweakInputMap.get(key);
+      if (!tweaks) {
+        throw new SparkValidationError("No tweaks for operator", {
+          field: "operator",
+          value: key,
+        });
+      }
+    }
+
+    const transferPackage = await this.prepareTransferPackage(
+      transfer.id,
+      keyTweakInputMap,
+      leaves,
+    );
+
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    const response = await sparkClient.finalize_transfer_with_transfer_package({
+      transferId: transfer.id,
+      ownerIdentityPublicKey: await this.config.signer.getIdentityPublicKey(),
+      transferPackage,
+    });
+
+    if (!response.transfer) {
+      throw new SparkValidationError("No transfer response from operator");
+    }
+
+    return response.transfer;
+  }
+
+  async prepareTransferForLightning(
+    leaves: LeafKeyTweak[],
+    paymentHash: Uint8Array,
+    expiryTime: Date,
+    transferID: string,
+  ): Promise<StartTransferRequest> {
+    if (leaves.length === 0) {
+      throw new SparkValidationError("leaves must not be empty");
+    }
+
+    const keyTweakInputMap = await this.prepareSendTransferKeyTweaks(
+      transferID,
+      leaves,
+    );
+
+    const transferPackage = await this.prepareTransferPackageForLightning(
+      transferID,
+      keyTweakInputMap,
+      leaves,
+      paymentHash,
+    );
+
+    return {
+      transferId: transferID,
+      ownerIdentityPublicKey: await this.config.signer.getIdentityPublicKey(),
+      receiverIdentityPublicKey: leaves[0]!.receiverIdentityPublicKey,
+      transferPackage,
+      sparkInvoice: "",
+      leavesToSend: [],
+      expiryTime,
+    };
+  }
+
+  async sendTransferWithKeyTweaks(
+    leaves: LeafKeyTweak[],
+    sparkInvoice?: SparkAddressFormat,
+  ): Promise<Transfer> {
+    if (leaves.length === 0) {
+      throw new SparkValidationError("leaves must not be empty");
+    }
+
+    const transferID = uuidv7();
+
+    const keyTweakInputMap = await this.prepareSendTransferKeyTweaks(
+      transferID,
+      leaves,
+    );
+
+    const transferPackage = await this.prepareTransferPackage(
+      transferID,
+      keyTweakInputMap,
+      leaves,
+    );
+
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    let response: StartTransferResponse;
+
+    try {
+      response = await sparkClient.start_transfer_v2({
+        transferId: transferID,
+        ownerIdentityPublicKey: await this.config.signer.getIdentityPublicKey(),
+        receiverIdentityPublicKey: leaves[0]!.receiverIdentityPublicKey,
+        transferPackage,
+        sparkInvoice,
+      });
+    } catch (error) {
+      throw new SparkRequestError("Failed to start transfer", {
+        method: "POST",
+        error,
+      });
+    }
+
+    if (!response.transfer) {
+      throw new SparkValidationError("No transfer response from operator");
+    }
+
+    return response.transfer;
+  }
+
+  async sendSwapTransfer(
+    leaves: LeafKeyTweak[],
+    transferId?: string,
+  ): Promise<{
+    swapTransfer: InitiateSwapPrimaryTransferResponse;
+    adaptorPubkey: Uint8Array;
+    adaptorAddedSignatureMap: Map<string, Uint8Array>;
+  }> {
+    if (leaves.length === 0) {
+      throw new SparkValidationError("leaves must not be empty");
+    }
+
+    const transferID = transferId ?? uuidv7();
+
+    const keyTweakInputMap = await this.prepareSendTransferKeyTweaks(
+      transferID,
+      leaves,
+    );
+
+    const adaptorPrivKey = secp256k1.utils.randomSecretKey();
+    const adaptorPubkey = secp256k1.getPublicKey(adaptorPrivKey);
+    const transferPackage = await this.prepareTransferPackage(
+      transferID,
+      keyTweakInputMap,
+      leaves,
+      adaptorPubkey,
+    );
+
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    transferPackage.directFromCpfpLeavesToSend = [];
+    transferPackage.directLeavesToSend = [];
+    try {
+      const response = await sparkClient.initiate_swap_primary_transfer({
+        transfer: {
+          transferId: transferID,
+          ownerIdentityPublicKey:
+            await this.config.signer.getIdentityPublicKey(),
+          receiverIdentityPublicKey: leaves[0]!.receiverIdentityPublicKey,
+          transferPackage,
+        },
+        adaptorPublicKeys: {
+          adaptorPublicKey: adaptorPubkey,
+        },
+      });
+
+      if (!response.transfer) {
+        throw new SparkValidationError("No transfer response from operator");
+      }
+
+      const adaptorAddedSignatureMap: Map<string, Uint8Array> = new Map();
+      for (const signingResult of response.signingResults) {
+        const leaf = transferPackage.leavesToSend.find(
+          (leaf) => leaf.leafId === signingResult.leafId,
+        );
+        const leaf_1 = leaves.find(
+          (leaf) => leaf.leaf.id === signingResult.leafId,
+        );
+        if (!leaf || !leaf_1) {
+          throw new SparkValidationError("Leaf not found", {
+            field: "leafId",
+            value: signingResult.leafId,
+          });
+        }
+
+        const message = getSigHashFromTx(
+          getTxFromRawTxBytes(leaf.rawTx),
+          0,
+          getTxFromRawTxBytes(leaf_1.leaf.nodeTx).getOutput(0),
+        );
+        const adaptorAddedSignature = await this.config.signer.aggregateFrost({
+          message: message,
+          publicKey: leaf.signingPublicKey,
+          verifyingKey: signingResult.verifyingKey,
+          selfCommitment: leaf.selfCommitment,
+          statechainCommitments:
+            signingResult.refundTxSigningResult?.signingNonceCommitments,
+          statechainSignatures:
+            signingResult.refundTxSigningResult?.signatureShares,
+          statechainPublicKeys: signingResult.refundTxSigningResult?.publicKeys,
+          selfSignature: leaf.userSignature,
+          adaptorPubKey: adaptorPubkey,
+        });
+        adaptorAddedSignatureMap.set(
+          signingResult.leafId,
+          adaptorAddedSignature,
+        );
+      }
+
+      return {
+        swapTransfer: response,
+        adaptorPubkey,
+        adaptorAddedSignatureMap,
+      };
+    } catch (error) {
+      throw new SparkRequestError("Failed to initiate swap primary transfer", {
+        method: "POST",
+        error: error as Error,
+      });
+    }
+  }
+
+  private async prepareTransferPackage(
+    transferID: string,
+    keyTweakInputMap: Map<string, SendLeafKeyTweak[]>,
+    leaves: LeafKeyTweak[],
+    adaptorPubKey?: Uint8Array,
+  ): Promise<TransferPackageWithSelfCommitments> {
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    const nodes: string[] = [];
+    for (const leaf of leaves) {
+      nodes.push(leaf.leaf.id);
+    }
+    const signingCommitments = await sparkClient.get_signing_commitments({
+      nodeIds: nodes,
+      count: 3,
+    });
+
+    const {
+      cpfpLeafSigningJobs,
+      directLeafSigningJobs,
+      directFromCpfpLeafSigningJobs,
+    } = await this.signingService.signRefunds(
+      leaves,
+      signingCommitments.signingCommitments.slice(0, leaves.length),
+      signingCommitments.signingCommitments.slice(
+        leaves.length,
+        2 * leaves.length,
+      ),
+      signingCommitments.signingCommitments.slice(
+        2 * leaves.length,
+        3 * leaves.length,
+      ),
+      adaptorPubKey,
+    );
+
+    const sparkFrost = getSparkFrost();
+    const encryptedKeyTweaksEntries = await Promise.all(
+      Array.from(keyTweakInputMap.entries()).map(async ([key, value]) => {
+        const protoToEncrypt: SendLeafKeyTweaks = {
+          leavesToSend: value,
+        };
+
+        const protoToEncryptBinary =
+          SendLeafKeyTweaks.encode(protoToEncrypt).finish();
+
+        const operator = this.config.getSigningOperators()[key];
+        if (!operator) {
+          throw new SparkValidationError("Operator not found");
+        }
+
+        const encryptedProto = await sparkFrost.encryptEcies(
+          protoToEncryptBinary,
+          hexToBytes(operator.identityPublicKey),
+        );
+
+        return [key, Uint8Array.from(encryptedProto)] as const;
+      }),
+    );
+    const encryptedKeyTweaks = Object.fromEntries(encryptedKeyTweaksEntries);
+    const transferPackage: TransferPackageWithSelfCommitments = {
+      leavesToSend: cpfpLeafSigningJobs,
+      keyTweakPackage: encryptedKeyTweaks,
+      userSignature: new Uint8Array(),
+      directLeavesToSend: directLeafSigningJobs,
+      directFromCpfpLeavesToSend: directFromCpfpLeafSigningJobs,
+      hashVariant: HashVariant.HASH_VARIANT_V2,
+    };
+
+    const transferPackageSigningPayload = getTransferPackageSigningPayload(
+      transferID,
+      transferPackage,
+    );
+    const signature = await this.config.signer.signMessageWithIdentityKey(
+      transferPackageSigningPayload,
+    );
+    transferPackage.userSignature = new Uint8Array(signature);
+
+    return transferPackage;
+  }
+
+  private async prepareTransferPackageForLightning(
+    transferID: string,
+    keyTweakInputMap: Map<string, SendLeafKeyTweak[]>,
+    leaves: LeafKeyTweak[],
+    paymentHash: Uint8Array,
+  ): Promise<TransferPackage> {
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    const nodes: string[] = [];
+
+    for (const leaf of leaves) {
+      nodes.push(leaf.leaf.id);
+    }
+    const signingCommitments = await sparkClient.get_signing_commitments({
+      nodeIds: nodes,
+      count: 3,
+    });
+
+    const {
+      cpfpLeafSigningJobs,
+      directLeafSigningJobs,
+      directFromCpfpLeafSigningJobs,
+    } = await this.signingService.signRefundsForLightning(
+      leaves,
+      signingCommitments.signingCommitments.slice(0, leaves.length),
+      signingCommitments.signingCommitments.slice(
+        leaves.length,
+        2 * leaves.length,
+      ),
+      signingCommitments.signingCommitments.slice(
+        2 * leaves.length,
+        3 * leaves.length,
+      ),
+      paymentHash,
+    );
+
+    const sparkFrost = getSparkFrost();
+    const encryptedKeyTweaksEntries = await Promise.all(
+      Array.from(keyTweakInputMap.entries()).map(async ([key, value]) => {
+        const protoToEncrypt: SendLeafKeyTweaks = {
+          leavesToSend: value,
+        };
+
+        const protoToEncryptBinary =
+          SendLeafKeyTweaks.encode(protoToEncrypt).finish();
+
+        const operator = this.config.getSigningOperators()[key];
+        if (!operator) {
+          throw new SparkValidationError("Operator not found");
+        }
+
+        const encryptedProto = await sparkFrost.encryptEcies(
+          protoToEncryptBinary,
+          hexToBytes(operator.identityPublicKey),
+        );
+
+        return [key, Uint8Array.from(encryptedProto)] as const;
+      }),
+    );
+    const encryptedKeyTweaks = Object.fromEntries(encryptedKeyTweaksEntries);
+
+    const transferPackage = TransferPackage.create({
+      leavesToSend: cpfpLeafSigningJobs,
+      keyTweakPackage: encryptedKeyTweaks,
+      userSignature: new Uint8Array(),
+      directLeavesToSend: directLeafSigningJobs,
+      directFromCpfpLeavesToSend: directFromCpfpLeafSigningJobs,
+      hashVariant: HashVariant.HASH_VARIANT_V2,
+    });
+
+    const transferPackageSigningPayload = getTransferPackageSigningPayload(
+      transferID,
+      transferPackage,
+    );
+    const signature = await this.config.signer.signMessageWithIdentityKey(
+      transferPackageSigningPayload,
+    );
+    transferPackage.userSignature = new Uint8Array(signature);
+
+    return transferPackage;
+  }
+
+  async signRefunds(
+    leafDataMap: Map<string, LeafRefundSigningData>,
+    operatorSigningResults: LeafRefundTxSigningResult[],
+  ): Promise<NodeSignatures[]> {
+    const nodeSignatures: NodeSignatures[] = [];
+    for (const operatorSigningResult of operatorSigningResults) {
+      const leafData = leafDataMap.get(operatorSigningResult.leafId);
+      if (
+        !leafData ||
+        !leafData.tx ||
+        leafData.vout === undefined ||
+        !leafData.refundTx
+      ) {
+        throw new Error(
+          `Leaf data not found for leaf ${operatorSigningResult.leafId}`,
+        );
+      }
+
+      const txOutput = leafData.tx?.getOutput(0);
+      if (!txOutput) {
+        throw new Error(
+          `Output not found for leaf ${operatorSigningResult.leafId}`,
+        );
+      }
+
+      // Sign CPFP refund transaction
+      // Use multi-input sighash for coop exit (2-input transactions with connector)
+      let cpfpRefundTxSighash: Uint8Array;
+      if (leafData.refundTx.inputsLength > 1 && leafData.connectorPrevOutput) {
+        cpfpRefundTxSighash = getSigHashFromMultiInputTx(leafData.refundTx, 0, [
+          txOutput,
+          leafData.connectorPrevOutput,
+        ]);
+      } else {
+        cpfpRefundTxSighash = getSigHashFromTx(leafData.refundTx, 0, txOutput);
+      }
+      const publicKey = await this.config.signer.getPublicKeyFromDerivation(
+        leafData.keyDerivation,
+      );
+      const cpfpUserSignature = await this.config.signer.signFrost({
+        message: cpfpRefundTxSighash,
+        publicKey,
+        keyDerivation: leafData.keyDerivation,
+        selfCommitment: leafData.signingNonceCommitment,
+        statechainCommitments:
+          operatorSigningResult.refundTxSigningResult?.signingNonceCommitments,
+        verifyingKey: operatorSigningResult.verifyingKey,
+      });
+
+      const cpfpRefundAggregate = await this.config.signer.aggregateFrost({
+        message: cpfpRefundTxSighash,
+        statechainSignatures:
+          operatorSigningResult.refundTxSigningResult?.signatureShares,
+        statechainPublicKeys:
+          operatorSigningResult.refundTxSigningResult?.publicKeys,
+        verifyingKey: operatorSigningResult.verifyingKey,
+        statechainCommitments:
+          operatorSigningResult.refundTxSigningResult?.signingNonceCommitments,
+        selfCommitment: leafData.signingNonceCommitment,
+        publicKey,
+        selfSignature: cpfpUserSignature,
+      });
+
+      // Sign direct refund transaction (spends direct tx output).
+      let directRefundAggregate: Uint8Array | undefined;
+      if (leafData.directTx && leafData.directRefundTx) {
+        const directTxOutput = leafData.directTx.getOutput(0);
+
+        // Use multi-input sighash for coop exit (2-input transactions with connector)
+        let directRefundTxSighash: Uint8Array;
+        if (
+          leafData.directRefundTx.inputsLength > 1 &&
+          leafData.connectorPrevOutput
+        ) {
+          directRefundTxSighash = getSigHashFromMultiInputTx(
+            leafData.directRefundTx,
+            0,
+            [directTxOutput, leafData.connectorPrevOutput],
+          );
+        } else {
+          directRefundTxSighash = getSigHashFromTx(
+            leafData.directRefundTx,
+            0,
+            directTxOutput,
+          );
+        }
+
+        const directUserSignature = await this.config.signer.signFrost({
+          message: directRefundTxSighash,
+          publicKey,
+          keyDerivation: leafData.keyDerivation,
+          selfCommitment: leafData.directSigningNonceCommitment,
+          statechainCommitments:
+            operatorSigningResult.directRefundTxSigningResult
+              ?.signingNonceCommitments,
+          verifyingKey: operatorSigningResult.verifyingKey,
+        });
+
+        directRefundAggregate = await this.config.signer.aggregateFrost({
+          message: directRefundTxSighash,
+          statechainSignatures:
+            operatorSigningResult.directRefundTxSigningResult?.signatureShares,
+          statechainPublicKeys:
+            operatorSigningResult.directRefundTxSigningResult?.publicKeys,
+          verifyingKey: operatorSigningResult.verifyingKey,
+          statechainCommitments:
+            operatorSigningResult.directRefundTxSigningResult
+              ?.signingNonceCommitments,
+          selfCommitment: leafData.directSigningNonceCommitment,
+          publicKey,
+          selfSignature: directUserSignature,
+        });
+      }
+
+      // Sign direct-from-CPFP refund transaction (spends CPFP tx output).
+      let directFromCpfpRefundAggregate: Uint8Array | undefined;
+      if (leafData.directFromCpfpRefundTx) {
+        // Use multi-input sighash for coop exit (2-input transactions with connector)
+        let directFromCpfpRefundTxSighash: Uint8Array;
+        if (
+          leafData.directFromCpfpRefundTx.inputsLength > 1 &&
+          leafData.connectorPrevOutput
+        ) {
+          directFromCpfpRefundTxSighash = getSigHashFromMultiInputTx(
+            leafData.directFromCpfpRefundTx,
+            0,
+            [txOutput, leafData.connectorPrevOutput],
+          );
+        } else {
+          directFromCpfpRefundTxSighash = getSigHashFromTx(
+            leafData.directFromCpfpRefundTx,
+            0,
+            txOutput,
+          );
+        }
+
+        const directFromCpfpUserSignature = await this.config.signer.signFrost({
+          message: directFromCpfpRefundTxSighash,
+          publicKey,
+          keyDerivation: leafData.keyDerivation,
+          selfCommitment: leafData.directFromCpfpRefundSigningNonceCommitment,
+          statechainCommitments:
+            operatorSigningResult.directFromCpfpRefundTxSigningResult
+              ?.signingNonceCommitments,
+          verifyingKey: operatorSigningResult.verifyingKey,
+        });
+
+        directFromCpfpRefundAggregate = await this.config.signer.aggregateFrost(
+          {
+            message: directFromCpfpRefundTxSighash,
+            statechainSignatures:
+              operatorSigningResult.directFromCpfpRefundTxSigningResult
+                ?.signatureShares,
+            statechainPublicKeys:
+              operatorSigningResult.directFromCpfpRefundTxSigningResult
+                ?.publicKeys,
+            verifyingKey: operatorSigningResult.verifyingKey,
+            statechainCommitments:
+              operatorSigningResult.directFromCpfpRefundTxSigningResult
+                ?.signingNonceCommitments,
+            selfCommitment: leafData.directFromCpfpRefundSigningNonceCommitment,
+            publicKey,
+            selfSignature: directFromCpfpUserSignature,
+          },
+        );
+      }
+
+      nodeSignatures.push({
+        nodeId: operatorSigningResult.leafId,
+        nodeTxSignature: new Uint8Array(),
+        directNodeTxSignature: new Uint8Array(),
+        refundTxSignature: cpfpRefundAggregate,
+        directRefundTxSignature: directRefundAggregate ?? new Uint8Array(),
+        directFromCpfpRefundTxSignature:
+          directFromCpfpRefundAggregate ?? new Uint8Array(),
+      });
+    }
+    return nodeSignatures;
+  }
+
+  protected async prepareSendTransferKeyTweaks(
+    transferID: string,
+    leaves: LeafKeyTweak[],
+    cpfpRefundSignatureMap: Map<string, Uint8Array> = new Map(),
+    directRefundSignatureMap: Map<string, Uint8Array> = new Map(),
+    directFromCpfpRefundSignatureMap: Map<string, Uint8Array> = new Map(),
+  ): Promise<Map<string, SendLeafKeyTweak[]>> {
+    const leavesTweaksMap = new Map<string, SendLeafKeyTweak[]>();
+
+    const results = await Promise.all(
+      leaves.map(async (leaf) => {
+        return await this.prepareSingleSendTransferKeyTweak(
+          transferID,
+          leaf,
+          leaf.receiverIdentityPublicKey,
+          cpfpRefundSignatureMap.get(leaf.leaf.id),
+          directRefundSignatureMap.get(leaf.leaf.id),
+          directFromCpfpRefundSignatureMap.get(leaf.leaf.id),
+        );
+      }),
+    );
+    for (const result of results) {
+      for (const [identifier, leafTweak] of result) {
+        leavesTweaksMap.set(identifier, [
+          ...(leavesTweaksMap.get(identifier) || []),
+          leafTweak,
+        ]);
+      }
+    }
+
+    return leavesTweaksMap;
+  }
+
+  private async prepareSingleSendTransferKeyTweak(
+    transferID: string,
+    leaf: LeafKeyTweak,
+    receiverPubkey: Uint8Array,
+    cpfpRefundSignature?: Uint8Array,
+    directRefundSignature?: Uint8Array,
+    directFromCpfpRefundSignature?: Uint8Array,
+  ): Promise<Map<string, SendLeafKeyTweak>> {
+    const signingOperators = this.config.getSigningOperators();
+
+    const { shares, secretCipher } =
+      await this.config.signer.subtractSplitAndEncrypt({
+        first: leaf.keyDerivation,
+        second: leaf.newKeyDerivation,
+        receiverPublicKey: receiverPubkey,
+        curveOrder: secp256k1.CURVE.n,
+        threshold: this.config.getThreshold(),
+        numShares: Object.keys(signingOperators).length,
+      });
+
+    const pubkeySharesTweak = new Map<string, Uint8Array>();
+    for (const [identifier, operator] of Object.entries(signingOperators)) {
+      const share = this.findShare(shares, operator.id);
+      if (!share) {
+        throw new Error(`Share not found for operator ${operator.id}`);
+      }
+
+      const pubkeyTweak = secp256k1.getPublicKey(share.share, true);
+      pubkeySharesTweak.set(identifier, pubkeyTweak);
+    }
+
+    const encoder = new TextEncoder();
+    const payload = new Uint8Array([
+      ...encoder.encode(leaf.leaf.id),
+      ...encoder.encode(transferID),
+      ...secretCipher,
+    ]);
+
+    const payloadHash = sha256(payload);
+    const signature = await this.config.signer.signMessageWithIdentityKey(
+      payloadHash,
+      true,
+    );
+
+    const leafTweaksMap = new Map<string, SendLeafKeyTweak>();
+    for (const [identifier, operator] of Object.entries(signingOperators)) {
+      const share = this.findShare(shares, operator.id);
+      if (!share) {
+        throw new Error(`Share not found for operator ${operator.id}`);
+      }
+
+      leafTweaksMap.set(identifier, {
+        leafId: leaf.leaf.id,
+        secretShareTweak: {
+          secretShare: share.share,
+          proofs: share.proofs,
+        },
+        pubkeySharesTweak: Object.fromEntries(pubkeySharesTweak),
+        secretCipher,
+        signature,
+        refundSignature: cpfpRefundSignature ?? new Uint8Array(),
+        directRefundSignature: directRefundSignature ?? new Uint8Array(),
+        directFromCpfpRefundSignature:
+          directFromCpfpRefundSignature ?? new Uint8Array(),
+      });
+    }
+
+    return leafTweaksMap;
+  }
+
+  protected findShare(shares: VerifiableSecretShare[], operatorID: number) {
+    const targetShareIndex = operatorID + 1;
+    for (const s of shares) {
+      if (s.index === targetShareIndex) {
+        return s;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * V3 transfer: supports per-leaf receiver routing and will eventually
+   * support multi-sender collaboration (e.g. atomic swaps). Each leaf
+   * must have receiverIdentityPublicKey set.
+   */
+  async sendTransferV3(leaves: LeafKeyTweak[]): Promise<Transfer> {
+    const transferID = uuidv7();
+    const expiryTime = new Date(Date.now() + DEFAULT_V3_TRANSFER_EXPIRY_MS);
+
+    const keyTweakInputMap = await this.prepareSendTransferKeyTweaks(
+      transferID,
+      leaves,
+    );
+
+    const transferPackage = await this.prepareTransferPackage(
+      transferID,
+      keyTweakInputMap,
+      leaves,
+    );
+
+    const receiverIdentityPublicKeys: { [key: string]: Uint8Array } = {};
+    for (const leaf of leaves) {
+      receiverIdentityPublicKeys[leaf.leaf.id] = leaf.receiverIdentityPublicKey;
+    }
+
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    let response: StartTransferResponse;
+    try {
+      response = await sparkClient.start_transfer_v3({
+        transferId: transferID,
+        senderPackages: [
+          {
+            ownerIdentityPublicKey:
+              await this.config.signer.getIdentityPublicKey(),
+            transferPackage,
+            receiverIdentityPublicKeys,
+          },
+        ],
+        expiryTime,
+      });
+    } catch (error) {
+      throw new SparkRequestError("Failed to start V3 transfer", {
+        method: "POST",
+        error,
+      });
+    }
+
+    if (!response.transfer) {
+      throw new SparkValidationError("No transfer response from operator");
+    }
+
+    return response.transfer;
+  }
+
+  private compareTransfers(transfer1: Transfer, transfer2: Transfer) {
+    return (
+      transfer1.id === transfer2.id &&
+      equalBytes(
+        transfer1.senderIdentityPublicKey,
+        transfer2.senderIdentityPublicKey,
+      ) &&
+      transfer1.status === transfer2.status &&
+      transfer1.totalValue === transfer2.totalValue &&
+      transfer1.expiryTime?.getTime() === transfer2.expiryTime?.getTime() &&
+      transfer1.leaves.length === transfer2.leaves.length
+    );
+  }
+}
+
+export class TransferService extends BaseTransferService {
+  constructor(
+    config: WalletConfigService,
+    connectionManager: ConnectionManager,
+    signingService: SigningService,
+    logging = LoggingService.fromConfig(config),
+  ) {
+    super(
+      config,
+      connectionManager,
+      signingService,
+      logging,
+      "TransferService",
+    );
+    logging.wrapPrototypeMethods("TransferService", this);
+  }
+
+  async claimTransferCore(transfer: Transfer): Promise<TreeNode[]> {
+    const leafPubKeyMap = await this.verifyPendingTransfer(transfer);
+    const selfIdentityPubkey = await this.config.signer.getIdentityPublicKey();
+
+    const leaves: LeafKeyTweak[] = [];
+
+    for (const leaf of transfer.leaves) {
+      if (leaf.leaf) {
+        const leafPubKey = leafPubKeyMap.get(leaf.leaf.id);
+        if (leafPubKey) {
+          leaves.push({
+            leaf: {
+              ...leaf.leaf,
+              refundTx: leaf.intermediateRefundTx,
+              directRefundTx: leaf.intermediateDirectRefundTx,
+              directFromCpfpRefundTx: leaf.intermediateDirectFromCpfpRefundTx,
+            },
+            keyDerivation: {
+              type: KeyDerivationType.ECIES,
+              path: leaf.secretCipher,
+            },
+            newKeyDerivation: {
+              type: KeyDerivationType.LEAF,
+              path: leaf.leaf.id,
+            },
+            receiverIdentityPublicKey: selfIdentityPubkey,
+          });
+        }
+      }
+    }
+
+    const claimPackage = await this.prepareClaimPackage(transfer.id, leaves);
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+    let response: ClaimTransferResponse;
+    try {
+      response = await sparkClient.claim_transfer({
+        transferId: transfer.id,
+        ownerIdentityPublicKey: await this.config.signer.getIdentityPublicKey(),
+        claimPackage,
+      });
+    } catch (error: unknown) {
+      throw new SparkRequestError("Failed to claim transfer", {
+        method: "POST",
+        error,
+      });
+    }
+    if (!response.transfer) {
+      throw new SparkValidationError(
+        "No transfer response from claim_transfer",
+      );
+    }
+    const nodes = response.transfer.leaves.flatMap((leaf) =>
+      leaf.leaf ? [leaf.leaf] : [],
+    );
+    return nodes;
+  }
+
+  // When transferIds is not provided, pending transfers for the receiver are returned.
+  async queryPendingTransfers(
+    optionsOrTransferIds: PendingTransferQueryOptions | string[] = {},
+  ): Promise<QueryTransfersResponse> {
+    const options = Array.isArray(optionsOrTransferIds)
+      ? { transferIds: optionsOrTransferIds }
+      : optionsOrTransferIds;
+    if (options.createdAfter && options.createdBefore) {
+      throw new Error(
+        "createdAfter and createdBefore are mutually exclusive - only one can be specified",
+      );
+    }
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+    const timeFilter =
+      options.createdAfter != null
+        ? {
+            $case: "createdAfter" as const,
+            createdAfter: options.createdAfter,
+          }
+        : options.createdBefore != null
+          ? {
+              $case: "createdBefore" as const,
+              createdBefore: options.createdBefore,
+            }
+          : undefined;
+    let pendingTransfersResp: QueryTransfersResponse;
+    try {
+      pendingTransfersResp = await sparkClient.query_pending_transfers({
+        participant: {
+          $case: "receiverIdentityPublicKey",
+          receiverIdentityPublicKey:
+            await this.config.signer.getIdentityPublicKey(),
+        },
+        transferIds: options.transferIds,
+        limit: options.limit,
+        offset: options.offset,
+        timeFilter,
+        network: this.config.getNetworkProto(),
+      });
+    } catch (error) {
+      throw new Error(
+        `Error querying pending transfers: ${formatUnknownError(error)}`,
+        { cause: error },
+      );
+    }
+    return pendingTransfersResp;
+  }
+
+  async queryPrimarySwapTransfers(
+    options: TransferQueryOptions,
+  ): Promise<QueryTransfersResponse> {
+    return await this.queryAllTransfers({
+      ...options,
+      senderOnly: true,
+      types: PRIMARY_SWAP_TYPES,
+      statuses: SENDER_PENDING_STATUSES,
+    });
+  }
+
+  async queryCounterSwapTransfers(
+    options: TransferQueryOptions,
+  ): Promise<QueryTransfersResponse> {
+    return await this.queryAllTransfers({
+      ...options,
+      types: COUNTER_SWAP_TYPES,
+      statuses: ACTIVE_COUNTER_SWAP_STATUSES,
+    });
+  }
+
+  async queryPendingOutgoingTransfers(
+    options: TransferQueryOptions,
+  ): Promise<QueryTransfersResponse> {
+    return await this.queryAllTransfers({
+      ...options,
+      senderOnly: true,
+      types: OUTGOING_TRANSFER_TYPES,
+      statuses: SENDER_PENDING_STATUSES,
+    });
+  }
+
+  /**
+   * Queries all transfers for the authenticated user with optional time filtering.
+   *
+   * @param limit - Maximum number of transfers to return
+   * @param offset - Pagination offset
+   * @param createdAfter - Optional: Return transfers created strictly after this time (exclusive). Mutually exclusive with createdBefore.
+   * @param createdBefore - Optional: Return transfers created strictly before this time (exclusive). Mutually exclusive with createdAfter.
+   * @returns Promise containing the query response with transfers
+   */
+  async queryAllTransfers({
+    limit,
+    offset,
+    createdAfter,
+    createdBefore,
+    types,
+    statuses,
+    senderOnly,
+  }: TransferQueryOptions & {
+    types: TransferType[];
+    statuses?: TransferStatus[];
+    senderOnly?: boolean;
+  }): Promise<QueryTransfersResponse> {
+    // Validate that only one time filter is provided (mutually exclusive)
+    if (createdAfter && createdBefore) {
+      throw new Error(
+        "createdAfter and createdBefore are mutually exclusive - only one can be specified",
+      );
+    }
+
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    const identityPublicKey = await this.config.signer.getIdentityPublicKey();
+
+    // Build filter object
+    const filter: DeepPartial<TransferFilter> = {
+      participant: senderOnly
+        ? {
+            $case: "senderIdentityPublicKey",
+            senderIdentityPublicKey: identityPublicKey,
+          }
+        : {
+            $case: "senderOrReceiverIdentityPublicKey",
+            senderOrReceiverIdentityPublicKey: identityPublicKey,
+          },
+      limit,
+      offset,
+      types,
+      ...(statuses !== undefined ? { statuses } : {}),
+      network: NetworkToProto[this.config.getNetwork()],
+    };
+
+    // Add optional time filter (mutually exclusive - only one can be set)
+    if (createdAfter) {
+      filter.timeFilter = {
+        $case: "createdAfter",
+        createdAfter,
+      };
+    } else if (createdBefore) {
+      filter.timeFilter = {
+        $case: "createdBefore",
+        createdBefore,
+      };
+    }
+
+    let allTransfersResp: QueryTransfersResponse;
+    try {
+      allTransfersResp = await sparkClient.query_all_transfers(filter);
+    } catch (error) {
+      throw new Error(
+        `Error querying all transfers: ${formatUnknownError(error)}`,
+        {
+          cause: error,
+        },
+      );
+    }
+    return allTransfersResp;
+  }
+
+  async verifyPendingTransfer(
+    transfer: Transfer,
+  ): Promise<Map<string, Uint8Array>> {
+    const leafPubKeyMap = new Map<string, Uint8Array>();
+    await Promise.all(
+      transfer.leaves.map(async (leaf) => {
+        if (!leaf.leaf) {
+          throw new Error("Leaf is undefined");
+        }
+
+        const encoder = new TextEncoder();
+        const leafIdBytes = encoder.encode(leaf.leaf.id);
+        const transferIdBytes = encoder.encode(transfer.id);
+
+        const payload = new Uint8Array([
+          ...leafIdBytes,
+          ...transferIdBytes,
+          ...leaf.secretCipher,
+        ]);
+
+        const payloadHash = sha256(payload);
+
+        if (
+          !secp256k1.verify(
+            leaf.signature,
+            payloadHash,
+            transfer.senderIdentityPublicKey,
+          )
+        ) {
+          throw new Error("Signature verification failed");
+        }
+
+        const leafSecret = await this.config.signer.decryptEcies(
+          leaf.secretCipher,
+        );
+
+        leafPubKeyMap.set(leaf.leaf.id, leafSecret);
+      }),
+    );
+    return leafPubKeyMap;
+  }
+
+  async queryTransfer(transferId: string): Promise<Transfer | undefined> {
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+    const transferResp = await sparkClient.query_all_transfers({
+      participant: {
+        $case: "senderOrReceiverIdentityPublicKey",
+        senderOrReceiverIdentityPublicKey:
+          await this.config.signer.getIdentityPublicKey(),
+      },
+      transferIds: [transferId],
+      network: NetworkToProto[this.config.getNetwork()],
+    });
+    return transferResp.transfers[0];
+  }
+
+  async sendTransferSignRefund(
+    leaves: LeafKeyTweak[],
+    expiryTime: Date,
+  ): Promise<{
+    transfer: Transfer;
+    signatureMap: Map<string, Uint8Array>;
+    directSignatureMap: Map<string, Uint8Array>;
+    directFromCpfpSignatureMap: Map<string, Uint8Array>;
+    leafDataMap: Map<string, LeafRefundSigningData>;
+  }> {
+    const {
+      transfer,
+      signatureMap,
+      directSignatureMap,
+      directFromCpfpSignatureMap,
+      leafDataMap,
+    } = await this.sendTransferSignRefundInternal(leaves, expiryTime);
+
+    return {
+      transfer,
+      signatureMap,
+      directSignatureMap,
+      directFromCpfpSignatureMap,
+      leafDataMap,
+    };
+  }
+
+  async sendTransferSignRefundInternal(
+    leaves: LeafKeyTweak[],
+    expiryTime: Date,
+  ): Promise<{
+    transfer: Transfer;
+    signatureMap: Map<string, Uint8Array>;
+    directSignatureMap: Map<string, Uint8Array>;
+    directFromCpfpSignatureMap: Map<string, Uint8Array>;
+    leafDataMap: Map<string, LeafRefundSigningData>;
+    signingResults: LeafRefundTxSigningResult[];
+  }> {
+    if (leaves.length === 0) {
+      throw new SparkValidationError("leaves must not be empty");
+    }
+
+    const transferId = uuidv7();
+    const leafDataMap = new Map<string, LeafRefundSigningData>();
+    await Promise.all(
+      leaves.map(async (leaf) => {
+        const signingNonceCommitment =
+          await this.config.signer.getRandomSigningCommitment();
+        const directSigningNonceCommitment =
+          await this.config.signer.getRandomSigningCommitment();
+        const directFromCpfpRefundSigningNonceCommitment =
+          await this.config.signer.getRandomSigningCommitment();
+
+        const tx = getTxFromRawTxBytes(leaf.leaf.nodeTx);
+        const refundTx = getTxFromRawTxBytes(leaf.leaf.refundTx);
+
+        const directTx =
+          leaf.leaf.directTx.length > 0
+            ? getTxFromRawTxBytes(leaf.leaf.directTx)
+            : undefined;
+
+        const directRefundTx =
+          leaf.leaf.directRefundTx.length > 0
+            ? getTxFromRawTxBytes(leaf.leaf.directRefundTx)
+            : undefined;
+        const directFromCpfpRefundTx =
+          leaf.leaf.directFromCpfpRefundTx.length > 0
+            ? getTxFromRawTxBytes(leaf.leaf.directFromCpfpRefundTx)
+            : undefined;
+
+        leafDataMap.set(leaf.leaf.id, {
+          keyDerivation: leaf.keyDerivation,
+          receivingPubkey: leaf.receiverIdentityPublicKey,
+          signingNonceCommitment,
+          directSigningNonceCommitment,
+          tx,
+          directTx,
+          refundTx,
+          directRefundTx,
+          directFromCpfpRefundTx,
+          directFromCpfpRefundSigningNonceCommitment,
+          vout: leaf.leaf.vout,
+        });
+      }),
+    );
+
+    const signingJobs = await this.prepareRefundSoSigningJobs(
+      leaves,
+      leafDataMap,
+    );
+
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    let response: CounterLeafSwapResponse;
+    try {
+      response = await sparkClient.start_transfer_v2({
+        transferId,
+        leavesToSend: signingJobs,
+        ownerIdentityPublicKey: await this.config.signer.getIdentityPublicKey(),
+        receiverIdentityPublicKey: leaves[0]!.receiverIdentityPublicKey,
+        expiryTime: expiryTime,
+      });
+    } catch (error) {
+      throw new Error(
+        `Error starting send transfer: ${formatUnknownError(error)}`,
+        { cause: error },
+      );
+    }
+
+    if (!response.transfer) {
+      throw new Error("No transfer response from coordinator");
+    }
+
+    const signatures = await this.signRefunds(
+      leafDataMap,
+      response.signingResults,
+    );
+
+    const cpfpSignatureMap = new Map<string, Uint8Array>();
+    const directSignatureMap = new Map<string, Uint8Array>();
+    const directFromCpfpSignatureMap = new Map<string, Uint8Array>();
+    for (const signature of signatures) {
+      cpfpSignatureMap.set(signature.nodeId, signature.refundTxSignature);
+      directSignatureMap.set(
+        signature.nodeId,
+        signature.directRefundTxSignature,
+      );
+      directFromCpfpSignatureMap.set(
+        signature.nodeId,
+        signature.directFromCpfpRefundTxSignature,
+      );
+    }
+
+    return {
+      transfer: response.transfer,
+      signatureMap: cpfpSignatureMap,
+      directSignatureMap: directSignatureMap,
+      directFromCpfpSignatureMap: directFromCpfpSignatureMap,
+      leafDataMap,
+      signingResults: response.signingResults,
+    };
+  }
+
+  private async prepareRefundSoSigningJobs(
+    leaves: LeafKeyTweak[],
+    leafDataMap: Map<string, LeafRefundSigningData>,
+    isForClaim?: boolean,
+  ): Promise<LeafRefundTxSigningJob[]> {
+    const signingJobs: LeafRefundTxSigningJob[] = [];
+    const results = await Promise.all(
+      leaves.map(async (leaf) => {
+        const refundSigningData = leafDataMap.get(leaf.leaf.id);
+        if (!refundSigningData) {
+          throw new Error(`Leaf data not found for leaf ${leaf.leaf.id}`);
+        }
+
+        const nodeTx = getTxFromRawTxBytes(leaf.leaf.nodeTx);
+
+        let directNodeTx: Transaction | undefined;
+        if (leaf.leaf.directTx.length > 0) {
+          directNodeTx = getTxFromRawTxBytes(leaf.leaf.directTx);
+        }
+
+        const currRefundTx = getTxFromRawTxBytes(leaf.leaf.refundTx);
+
+        const currentSequence = currRefundTx.getInput(0).sequence;
+        if (currentSequence == null) {
+          throw new SparkValidationError("Invalid refund transaction", {
+            field: "sequence",
+            value: currRefundTx.getInput(0),
+            expected: "Non-null sequence",
+          });
+        }
+
+        const refundTxsParams = {
+          nodeTx: nodeTx,
+          directNodeTx: directNodeTx,
+          sequence: currentSequence,
+          receivingPubkey: refundSigningData.receivingPubkey,
+          network: this.config.getNetwork(),
+        };
+
+        const { cpfpRefundTx, directRefundTx, directFromCpfpRefundTx } =
+          await (isForClaim
+            ? createCurrentTimelockRefundTxs(refundTxsParams)
+            : createDecrementedTimelockRefundTxs(refundTxsParams));
+
+        const isZeroNode = !getCurrentTimelock(nodeTx.getInput(0).sequence);
+
+        refundSigningData.refundTx = cpfpRefundTx;
+        refundSigningData.directRefundTx =
+          directRefundTx && !isZeroNode ? directRefundTx : undefined;
+        refundSigningData.directFromCpfpRefundTx = directFromCpfpRefundTx;
+
+        const cpfpRefundNonceCommitmentProto =
+          refundSigningData.signingNonceCommitment;
+        const directRefundNonceCommitmentProto =
+          refundSigningData.directSigningNonceCommitment;
+        const directFromCpfpRefundNonceCommitmentProto =
+          refundSigningData.directFromCpfpRefundSigningNonceCommitment;
+
+        const signingPublicKey =
+          await this.config.signer.getPublicKeyFromDerivation(
+            refundSigningData.keyDerivation,
+          );
+        return {
+          leafId: leaf.leaf.id,
+          refundTxSigningJob: {
+            signingPublicKey,
+            rawTx: cpfpRefundTx.toBytes(),
+            signingNonceCommitment: cpfpRefundNonceCommitmentProto.commitment,
+          },
+          directRefundTxSigningJob:
+            directRefundTx && !isZeroNode
+              ? {
+                  signingPublicKey,
+                  rawTx: directRefundTx.toBytes(),
+                  signingNonceCommitment:
+                    directRefundNonceCommitmentProto.commitment,
+                }
+              : undefined,
+          directFromCpfpRefundTxSigningJob: directFromCpfpRefundTx
+            ? {
+                signingPublicKey,
+                rawTx: directFromCpfpRefundTx.toBytes(),
+                signingNonceCommitment:
+                  directFromCpfpRefundNonceCommitmentProto.commitment,
+              }
+            : undefined,
+        };
+      }),
+    );
+
+    for (const result of results) {
+      signingJobs.push(result);
+    }
+
+    return signingJobs;
+  }
+
+  async claimTransferTweakKeys(
+    transfer: Transfer,
+    leaves: LeafKeyTweak[],
+  ): Promise<void> {
+    const leavesTweaksMap = await this.prepareClaimLeavesKeyTweaks(leaves);
+
+    const errors: Error[] = [];
+
+    const promises = Object.entries(this.config.getSigningOperators()).map(
+      async ([identifier, operator]) => {
+        const sparkClient = await this.connectionManager.createSparkClient(
+          operator.address,
+        );
+
+        const leavesToReceive = leavesTweaksMap.get(identifier);
+        if (!leavesToReceive) {
+          errors.push(
+            new SparkValidationError("No leaves to receive for operator", {
+              field: "operator",
+              value: identifier,
+            }),
+          );
+          return;
+        }
+
+        try {
+          await sparkClient.claim_transfer_tweak_keys({
+            transferId: transfer.id,
+            ownerIdentityPublicKey:
+              await this.config.signer.getIdentityPublicKey(),
+            leavesToReceive,
+          });
+        } catch (error: unknown) {
+          errors.push(
+            new SparkRequestError("Failed to claim transfer tweak keys", {
+              method: "POST",
+              error,
+            }),
+          );
+          return;
+        }
+      },
+    );
+
+    await Promise.all(promises);
+
+    if (errors.length > 0) {
+      throw errors[0] ?? new Error("Failed to claim transfer tweak keys");
+    }
+  }
+
+  protected async prepareClaimPackage(
+    transferId: string,
+    leaves: LeafKeyTweak[],
+  ): Promise<ClaimPackage> {
+    // 1. Prepare key tweaks per SO
+    const leavesTweaksMap = await this.prepareClaimLeavesKeyTweaks(leaves);
+
+    // 2. ECIES-encrypt key tweaks per SO
+    const sparkFrost = getSparkFrost();
+    const encryptedKeyTweaksEntries = await Promise.all(
+      Array.from(leavesTweaksMap.entries()).map(async ([key, value]) => {
+        const protoToEncrypt: ClaimLeafKeyTweaks = {
+          leavesToReceive: value,
+        };
+        const protoToEncryptBinary =
+          ClaimLeafKeyTweaks.encode(protoToEncrypt).finish();
+
+        const operator = this.config.getSigningOperators()[key];
+        if (!operator) {
+          throw new SparkValidationError("Operator not found");
+        }
+        const encryptedProto = await sparkFrost.encryptEcies(
+          protoToEncryptBinary,
+          hexToBytes(operator.identityPublicKey),
+        );
+        return [key, Uint8Array.from(encryptedProto)] as const;
+      }),
+    );
+    const keyTweakPackage: Record<string, Uint8Array> = Object.fromEntries(
+      encryptedKeyTweaksEntries,
+    );
+
+    // 3. Get signing commitments (use nodeIdCount since receiver doesn't own leaves yet)
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+    const signingCommitments = await sparkClient.get_signing_commitments({
+      nodeIdCount: leaves.length,
+      count: 3,
+    });
+    const expectedCommitments = 3 * leaves.length;
+    if (signingCommitments.signingCommitments.length !== expectedCommitments) {
+      throw new SparkValidationError(
+        `Expected ${expectedCommitments} signing commitments, got ${signingCommitments.signingCommitments.length}`,
+      );
+    }
+
+    // 4. Build claim leaves with receiver's key derivation and per-leaf pubkeys
+    const claimLeaves: LeafKeyTweak[] = await Promise.all(
+      leaves.map(async (leaf) => ({
+        leaf: leaf.leaf,
+        keyDerivation: leaf.newKeyDerivation,
+        newKeyDerivation: leaf.newKeyDerivation,
+        receiverIdentityPublicKey:
+          await this.config.signer.getPublicKeyFromDerivation(
+            leaf.newKeyDerivation,
+          ),
+      })),
+    );
+
+    // 5. Sign refunds using current timelock (not decremented).
+    const {
+      cpfpLeafSigningJobs,
+      directLeafSigningJobs,
+      directFromCpfpLeafSigningJobs,
+    } = await this.signingService.signRefundsForClaim(
+      claimLeaves,
+      signingCommitments.signingCommitments.slice(0, leaves.length),
+      signingCommitments.signingCommitments.slice(
+        leaves.length,
+        2 * leaves.length,
+      ),
+      signingCommitments.signingCommitments.slice(
+        2 * leaves.length,
+        3 * leaves.length,
+      ),
+    );
+
+    // 7. Assemble and sign ClaimPackage
+    const claimPackage: ClaimPackage = {
+      leavesToClaim: cpfpLeafSigningJobs,
+      keyTweakPackage,
+      userSignature: new Uint8Array(),
+      directLeavesToClaim: directLeafSigningJobs,
+      directFromCpfpLeavesToClaim: directFromCpfpLeafSigningJobs,
+      hashVariant: HashVariant.HASH_VARIANT_V2,
+    };
+
+    const signingPayload = getClaimPackageSigningPayload(
+      transferId,
+      keyTweakPackage,
+    );
+    const signature =
+      await this.config.signer.signMessageWithIdentityKey(signingPayload);
+    claimPackage.userSignature = new Uint8Array(signature);
+
+    return claimPackage;
+  }
+
+  private async prepareClaimLeavesKeyTweaks(
+    leaves: LeafKeyTweak[],
+  ): Promise<Map<string, ClaimLeafKeyTweak[]>> {
+    const leafDataMap = new Map<string, ClaimLeafKeyTweak[]>();
+
+    const results = await Promise.all(
+      leaves.map((leaf) => this.prepareClaimLeafKeyTweaks(leaf)),
+    );
+
+    for (const { leafKeyTweaks: leafData } of results) {
+      for (const [identifier, leafTweak] of leafData) {
+        leafDataMap.set(identifier, [
+          ...(leafDataMap.get(identifier) || []),
+          leafTweak,
+        ]);
+      }
+    }
+
+    return leafDataMap;
+  }
+
+  private async prepareClaimLeafKeyTweaks(leaf: LeafKeyTweak): Promise<{
+    leafKeyTweaks: Map<string, ClaimLeafKeyTweak>;
+    proofs: Uint8Array[];
+  }> {
+    const signingOperators = this.config.getSigningOperators();
+
+    const shares =
+      await this.config.signer.subtractAndSplitSecretWithProofsGivenDerivations(
+        {
+          first: leaf.keyDerivation,
+          second: leaf.newKeyDerivation,
+          curveOrder: secp256k1.CURVE.n,
+          threshold: this.config.getThreshold(),
+          numShares: Object.keys(signingOperators).length,
+        },
+      );
+
+    const pubkeySharesTweak = new Map<string, Uint8Array>();
+
+    for (const [identifier, operator] of Object.entries(signingOperators)) {
+      const share = this.findShare(shares, operator.id);
+      if (!share) {
+        throw new Error(`Share not found for operator ${operator.id}`);
+      }
+      const pubkeyTweak = secp256k1.getPublicKey(share.share);
+      pubkeySharesTweak.set(identifier, pubkeyTweak);
+    }
+
+    const leafTweaksMap = new Map<string, ClaimLeafKeyTweak>();
+    for (const [identifier, operator] of Object.entries(signingOperators)) {
+      const share = this.findShare(shares, operator.id);
+      if (!share) {
+        throw new Error(`Share not found for operator ${operator.id}`);
+      }
+
+      leafTweaksMap.set(identifier, {
+        leafId: leaf.leaf.id,
+        secretShareTweak: {
+          secretShare: share.share,
+          proofs: share.proofs,
+        },
+        pubkeySharesTweak: Object.fromEntries(pubkeySharesTweak),
+      });
+    }
+
+    if (!shares[0]?.proofs) {
+      throw new SparkValidationError("Proofs not found", {
+        field: "proofs",
+        value: shares[0]?.proofs,
+      });
+    }
+
+    return { leafKeyTweaks: leafTweaksMap, proofs: shares[0].proofs };
+  }
+
+  async claimTransferSignRefunds(
+    transfer: Transfer,
+    leafKeys: LeafKeyTweak[],
+  ): Promise<NodeSignatures[]> {
+    const leafDataMap: Map<string, LeafRefundSigningData> = new Map();
+    await Promise.all(
+      leafKeys.map(async (leafKey) => {
+        const tx = getTxFromRawTxBytes(leafKey.leaf.nodeTx);
+        const directTx =
+          leafKey.leaf.directTx.length > 0
+            ? getTxFromRawTxBytes(leafKey.leaf.directTx)
+            : undefined;
+
+        leafDataMap.set(leafKey.leaf.id, {
+          keyDerivation: leafKey.newKeyDerivation,
+          receivingPubkey: await this.config.signer.getPublicKeyFromDerivation(
+            leafKey.newKeyDerivation,
+          ),
+          signingNonceCommitment:
+            await this.config.signer.getRandomSigningCommitment(),
+          directSigningNonceCommitment:
+            await this.config.signer.getRandomSigningCommitment(),
+          directFromCpfpRefundSigningNonceCommitment:
+            await this.config.signer.getRandomSigningCommitment(),
+          tx,
+          directTx,
+          vout: leafKey.leaf.vout,
+        });
+      }),
+    );
+
+    const signingJobs = await this.prepareRefundSoSigningJobs(
+      leafKeys,
+      leafDataMap,
+      true,
+    );
+
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+    let resp: ClaimTransferSignRefundsResponse;
+
+    try {
+      resp = await sparkClient.claim_transfer_sign_refunds_v2({
+        transferId: transfer.id,
+        ownerIdentityPublicKey: await this.config.signer.getIdentityPublicKey(),
+        signingJobs,
+      });
+    } catch (error: unknown) {
+      throw new SparkRequestError("Failed to claim transfer sign refunds", {
+        method: "POST",
+        error,
+      });
+    }
+    return this.signRefunds(leafDataMap, resp.signingResults);
+  }
+
+  private async finalizeNodeSignatures(nodeSignatures: NodeSignatures[]) {
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+    try {
+      return await sparkClient.finalize_node_signatures_v2({
+        intent: SignatureIntent.TRANSFER,
+        nodeSignatures,
+      });
+    } catch (error) {
+      throw new Error(
+        `Error finalizing node signatures in transfer: ${formatUnknownError(error)}`,
+        { cause: error },
+      );
+    }
+  }
+
+  async queryPendingTransfersBySender(
+    operatorAddress: string,
+  ): Promise<QueryTransfersResponse> {
+    const sparkClient =
+      await this.connectionManager.createSparkClient(operatorAddress);
+    try {
+      return await sparkClient.query_pending_transfers({
+        participant: {
+          $case: "senderIdentityPublicKey",
+          senderIdentityPublicKey:
+            await this.config.signer.getIdentityPublicKey(),
+        },
+      });
+    } catch (error) {
+      throw new Error(
+        `Error querying pending transfers by sender: ${formatUnknownError(error)}`,
+        { cause: error },
+      );
+    }
+  }
+
+  async renewRefundTxn(
+    node: TreeNode,
+    parentNode: TreeNode,
+  ): Promise<TreeNode> {
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    const signingJobs = await this.createRenewRefundSigningJobs(
+      node,
+      parentNode,
+    );
+
+    const statechainCommitments = await sparkClient.get_signing_commitments({
+      nodeIds: [node.id],
+      count: signingJobs.length,
+    });
+
+    const mappedSigningJobs = signingJobs.map((signingJob, index) => {
+      const signingNonceCommitments =
+        statechainCommitments.signingCommitments[index]
+          ?.signingNonceCommitments;
+      if (!signingNonceCommitments) {
+        throw new Error("Signing nonce commitments not found");
+      }
+
+      return {
+        ...signingJob,
+        signingNonceCommitments,
+      };
+    });
+    const userSignedTxSigningJobs =
+      await this.signingService.signSigningJobs(mappedSigningJobs);
+
+    const renewRefundTimelockSigningJob: RenewRefundTimelockSigningJob = {
+      nodeTxSigningJob: userSignedTxSigningJobs.get("node"),
+      refundTxSigningJob: userSignedTxSigningJobs.get("cpfp"),
+      directNodeTxSigningJob: userSignedTxSigningJobs.get("directNode"),
+      directRefundTxSigningJob: userSignedTxSigningJobs.get("direct"),
+      directFromCpfpRefundTxSigningJob:
+        userSignedTxSigningJobs.get("directFromCpfp"),
+    };
+
+    const response = await sparkClient.renew_leaf(
+      {
+        leafId: node.id,
+        signingJobs: {
+          $case: "renewRefundTimelockSigningJob",
+          renewRefundTimelockSigningJob,
+        },
+      },
+      optionsWithIdempotencyKey(getTxFromRawTxBytes(node.refundTx).id),
+    );
+
+    if (
+      response.renewResult?.$case !== "renewRefundTimelockResult" ||
+      !response.renewResult?.renewRefundTimelockResult.node
+    ) {
+      throw new SparkValidationError("Unexpected renew result", {
+        field: "renewResult",
+        value: response.renewResult,
+      });
+    }
+
+    return response.renewResult?.renewRefundTimelockResult.node;
+  }
+
+  async renewNodeTxn(node: TreeNode, parentNode: TreeNode): Promise<TreeNode> {
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    const signingJobs = await this.createRenewNodeSigningJobs(node, parentNode);
+
+    const statechainCommitments = await sparkClient.get_signing_commitments({
+      nodeIds: [node.id],
+      count: signingJobs.length,
+    });
+
+    const mappedSigningJobs = signingJobs.map((signingJob, index) => {
+      const signingNonceCommitments =
+        statechainCommitments.signingCommitments[index]
+          ?.signingNonceCommitments;
+      if (!signingNonceCommitments) {
+        throw new Error("Signing nonce commitments not found");
+      }
+      return {
+        ...signingJob,
+        signingNonceCommitments,
+      };
+    });
+    const userSignedTxSigningJobs =
+      await this.signingService.signSigningJobs(mappedSigningJobs);
+
+    const response = await sparkClient.renew_leaf(
+      {
+        leafId: node.id,
+        signingJobs: {
+          $case: "renewNodeTimelockSigningJob",
+          renewNodeTimelockSigningJob: {
+            splitNodeTxSigningJob: userSignedTxSigningJobs.get("split"),
+            splitNodeDirectTxSigningJob:
+              userSignedTxSigningJobs.get("directSplit"),
+            nodeTxSigningJob: userSignedTxSigningJobs.get("node"),
+            directNodeTxSigningJob: userSignedTxSigningJobs.get("directNode"),
+            refundTxSigningJob: userSignedTxSigningJobs.get("cpfp"),
+            directRefundTxSigningJob: userSignedTxSigningJobs.get("direct"),
+            directFromCpfpRefundTxSigningJob:
+              userSignedTxSigningJobs.get("directFromCpfp"),
+          },
+        },
+      },
+      optionsWithIdempotencyKey(getTxFromRawTxBytes(node.refundTx).id),
+    );
+
+    if (
+      response.renewResult?.$case !== "renewNodeTimelockResult" ||
+      !response.renewResult?.renewNodeTimelockResult.node
+    ) {
+      throw new SparkValidationError("Unexpected renew result", {
+        field: "renewResult",
+        value: response.renewResult,
+      });
+    }
+
+    return response.renewResult.renewNodeTimelockResult.node;
+  }
+
+  private async createRenewRefundSigningJobs(
+    node: TreeNode,
+    parentNode: TreeNode,
+  ) {
+    const signingJobs: SigningJobWithOptionalNonce[] = [];
+
+    const parentTx = getTxFromRawTxBytes(parentNode.nodeTx);
+
+    const parentNodeOutput = getTxFromRawTxBytes(parentNode.nodeTx).getOutput(
+      0,
+    );
+    if (!parentNodeOutput) {
+      throw new Error("Parent node output not found");
+    }
+
+    const unsignedParentNodeOutput: TransactionOutput = {
+      script: parentNodeOutput.script!,
+      amount: parentNodeOutput.amount!,
+    };
+
+    const keyDerivation: KeyDerivation = {
+      type: KeyDerivationType.LEAF,
+      path: node.id,
+    };
+    const signingPublicKey =
+      await this.config.signer.getPublicKeyFromDerivation(keyDerivation);
+
+    const nodeTx = getTxFromRawTxBytes(node.nodeTx);
+    const refundTx = getTxFromRawTxBytes(node.refundTx);
+
+    const { nodeTx: newNodeTx, directNodeTx: newDirectNodeTx } =
+      await createDecrementedTimelockNodeTx(
+        parentTx,
+        nodeTx,
+        this.config.getNetwork(),
+      );
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: newNodeTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "node",
+      parentTxOut: unsignedParentNodeOutput,
+      leafId: node.id,
+      keyDerivation: {
+        type: KeyDerivationType.LEAF,
+        path: node.id,
+      },
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    if (newDirectNodeTx) {
+      signingJobs.push({
+        signingPublicKey,
+        rawTx: newDirectNodeTx.toBytes(),
+        signingNonceCommitment:
+          await this.config.signer.getRandomSigningCommitment(),
+        type: "directNode",
+        parentTxOut: unsignedParentNodeOutput,
+        leafId: node.id,
+        keyDerivation: {
+          type: KeyDerivationType.LEAF,
+          path: node.id,
+        },
+        verifyingKey: node.verifyingPublicKey,
+      });
+    }
+
+    const newCpfpNodeOutput: TransactionOutput = newNodeTx.getOutput(0);
+    if (!newCpfpNodeOutput) {
+      throw Error("Could not get new cpfp node output");
+    }
+
+    const newDirectNodeOutput: TransactionOutput | undefined =
+      newDirectNodeTx?.getOutput(0);
+
+    const amountSats = refundTx.getOutput(0).amount;
+    if (amountSats === undefined) {
+      throw new Error("Amount not found in extendTimelock");
+    }
+
+    const directAmountSats = newDirectNodeOutput?.amount;
+    if (directAmountSats === undefined) {
+      throw new Error("Amount not found in extendTimelock");
+    }
+
+    const {
+      cpfpRefundTx: newRefundTx,
+      directRefundTx: newDirectRefundTx,
+      directFromCpfpRefundTx: newDirectFromCpfpRefundTx,
+    } = await createInitialTimelockRefundTxs({
+      nodeTx: newNodeTx,
+      directNodeTx: newDirectNodeTx,
+      receivingPubkey: signingPublicKey,
+      network: this.config.getNetwork(),
+    });
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: newRefundTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "cpfp",
+      parentTxOut: newCpfpNodeOutput,
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    if (newDirectRefundTx && newDirectNodeOutput) {
+      signingJobs.push({
+        signingPublicKey,
+        rawTx: newDirectRefundTx.toBytes(),
+        signingNonceCommitment:
+          await this.config.signer.getRandomSigningCommitment(),
+        type: "direct",
+        parentTxOut: newDirectNodeOutput,
+        leafId: node.id,
+        keyDerivation,
+        verifyingKey: node.verifyingPublicKey,
+      });
+    }
+
+    if (newDirectFromCpfpRefundTx && newDirectNodeOutput) {
+      signingJobs.push({
+        signingPublicKey,
+        rawTx: newDirectFromCpfpRefundTx.toBytes(),
+        signingNonceCommitment:
+          await this.config.signer.getRandomSigningCommitment(),
+        type: "directFromCpfp",
+        parentTxOut: newCpfpNodeOutput,
+        leafId: node.id,
+        keyDerivation,
+        verifyingKey: node.verifyingPublicKey,
+      });
+    }
+
+    return signingJobs;
+  }
+
+  private async createRenewNodeSigningJobs(
+    node: TreeNode,
+    parentNode: TreeNode,
+  ): Promise<SigningJobWithOptionalNonce[]> {
+    const signingJobs: SigningJobWithOptionalNonce[] = [];
+
+    const parentTx = getTxFromRawTxBytes(parentNode.nodeTx);
+    const parentNodeOutput = getTxFromRawTxBytes(parentNode.nodeTx).getOutput(
+      0,
+    );
+
+    const unsignedParentNodeOutput: TransactionOutput = {
+      script: parentNodeOutput.script!,
+      amount: parentNodeOutput.amount!,
+    };
+
+    const keyDerivation: KeyDerivation = {
+      type: KeyDerivationType.LEAF,
+      path: node.id,
+    };
+    const signingPublicKey =
+      await this.config.signer.getPublicKeyFromDerivation(keyDerivation);
+
+    const { nodeTx: splitNodeTx, directNodeTx: splitNodeDirectTx } =
+      await createZeroTimelockNodeTx(parentTx, this.config.getNetwork());
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: splitNodeTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "split",
+      parentTxOut: unsignedParentNodeOutput,
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    if (splitNodeDirectTx) {
+      signingJobs.push({
+        signingPublicKey,
+        rawTx: splitNodeDirectTx.toBytes(),
+        signingNonceCommitment:
+          await this.config.signer.getRandomSigningCommitment(),
+        type: "directSplit",
+        parentTxOut: unsignedParentNodeOutput,
+        leafId: node.id,
+        keyDerivation,
+        verifyingKey: node.verifyingPublicKey,
+      });
+    }
+
+    const splitNodeOutput = splitNodeTx.getOutput(0);
+
+    const { nodeTx: newNodeTx, directNodeTx: newDirectNodeTx } =
+      await createInitialTimelockNodeTx(splitNodeTx, this.config.getNetwork());
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: newNodeTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "node",
+      parentTxOut: splitNodeOutput,
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    if (newDirectNodeTx) {
+      signingJobs.push({
+        signingPublicKey,
+        rawTx: newDirectNodeTx.toBytes(),
+        signingNonceCommitment:
+          await this.config.signer.getRandomSigningCommitment(),
+        type: "directNode",
+        parentTxOut: splitNodeOutput,
+        leafId: node.id,
+        keyDerivation,
+        verifyingKey: node.verifyingPublicKey,
+      });
+    }
+
+    const newCpfpNodeOutput: TransactionOutput = newNodeTx.getOutput(0);
+    if (!newCpfpNodeOutput) {
+      throw Error("Could not get new cpfp node output");
+    }
+
+    const newDirectNodeOutput: TransactionOutput | undefined =
+      newDirectNodeTx?.getOutput(0);
+
+    const {
+      cpfpRefundTx: newRefundTx,
+      directRefundTx: newDirectRefundTx,
+      directFromCpfpRefundTx: newDirectFromCpfpRefundTx,
+    } = await createInitialTimelockRefundTxs({
+      nodeTx: newNodeTx,
+      directNodeTx: newDirectNodeTx,
+      receivingPubkey: signingPublicKey,
+      network: this.config.getNetwork(),
+    });
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: newRefundTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "cpfp",
+      parentTxOut: newCpfpNodeOutput,
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    if (newDirectRefundTx && newDirectNodeOutput) {
+      signingJobs.push({
+        signingPublicKey,
+        rawTx: newDirectRefundTx.toBytes(),
+        signingNonceCommitment:
+          await this.config.signer.getRandomSigningCommitment(),
+        type: "direct",
+        parentTxOut: newDirectNodeOutput,
+        leafId: node.id,
+        keyDerivation,
+        verifyingKey: node.verifyingPublicKey,
+      });
+    }
+
+    if (newDirectFromCpfpRefundTx && newDirectNodeOutput) {
+      signingJobs.push({
+        signingPublicKey,
+        rawTx: newDirectFromCpfpRefundTx.toBytes(),
+        signingNonceCommitment:
+          await this.config.signer.getRandomSigningCommitment(),
+        type: "directFromCpfp",
+        parentTxOut: newCpfpNodeOutput,
+        leafId: node.id,
+        keyDerivation,
+        verifyingKey: node.verifyingPublicKey,
+      });
+    }
+
+    return signingJobs;
+  }
+
+  async renewZeroTimelockNodeTxn(node: TreeNode): Promise<TreeNode> {
+    const sparkClient = await this.connectionManager.createSparkClient(
+      this.config.getCoordinatorAddress(),
+    );
+
+    const signingJobs = await this.createRenewZeroTimelockNodeSigningJobs(node);
+
+    const statechainCommitments = await sparkClient.get_signing_commitments({
+      nodeIds: [node.id],
+      count: signingJobs.length,
+    });
+
+    const mappedSigningJobs = signingJobs.map((signingJob, index) => {
+      const signingNonceCommitments =
+        statechainCommitments.signingCommitments[index]
+          ?.signingNonceCommitments;
+      if (!signingNonceCommitments) {
+        throw new SparkValidationError("Signing nonce commitments not found", {
+          field: "signingNonceCommitments",
+          value: signingNonceCommitments,
+        });
+      }
+      return {
+        ...signingJob,
+        signingNonceCommitments,
+      };
+    });
+
+    const userSignedTxSigningJobs =
+      await this.signingService.signSigningJobs(mappedSigningJobs);
+
+    const renewZeroTimelockNodeSigningJob: RenewNodeZeroTimelockSigningJob = {
+      nodeTxSigningJob: userSignedTxSigningJobs.get("node"),
+      refundTxSigningJob: userSignedTxSigningJobs.get("cpfp"),
+      directNodeTxSigningJob: userSignedTxSigningJobs.get("directNode"),
+      directFromCpfpRefundTxSigningJob:
+        userSignedTxSigningJobs.get("directFromCpfp"),
+    };
+
+    const response = await sparkClient.renew_leaf(
+      {
+        leafId: node.id,
+        signingJobs: {
+          $case: "renewNodeZeroTimelockSigningJob",
+          renewNodeZeroTimelockSigningJob: renewZeroTimelockNodeSigningJob,
+        },
+      },
+      optionsWithIdempotencyKey(getTxFromRawTxBytes(node.refundTx).id),
+    );
+
+    if (
+      response.renewResult?.$case !== "renewNodeZeroTimelockResult" ||
+      !response.renewResult?.renewNodeZeroTimelockResult.node
+    ) {
+      throw new SparkValidationError("Unexpected renew result", {
+        field: "renewResult",
+        value: response.renewResult,
+      });
+    }
+
+    return response.renewResult.renewNodeZeroTimelockResult.node;
+  }
+
+  private async createRenewZeroTimelockNodeSigningJobs(
+    node: TreeNode,
+  ): Promise<SigningJobWithOptionalNonce[]> {
+    const signingJobs: SigningJobWithOptionalNonce[] = [];
+
+    const keyDerivation: KeyDerivation = {
+      type: KeyDerivationType.LEAF,
+      path: node.id,
+    };
+    const signingPublicKey =
+      await this.config.signer.getPublicKeyFromDerivation(keyDerivation);
+
+    const nodeTx = getTxFromRawTxBytes(node.nodeTx);
+
+    const { nodeTx: newNodeTx, directNodeTx: newDirectNodeTx } =
+      await createZeroTimelockNodeTx(nodeTx, this.config.getNetwork());
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: newNodeTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "node",
+      parentTxOut: nodeTx.getOutput(0),
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: newDirectNodeTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "directNode",
+      parentTxOut: nodeTx.getOutput(0),
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    // direct refund spending direct node tx
+    const { cpfpRefundTx, directFromCpfpRefundTx } =
+      await createInitialTimelockRefundTxs({
+        nodeTx: newNodeTx,
+        directNodeTx: newDirectNodeTx,
+        receivingPubkey: signingPublicKey,
+        network: this.config.getNetwork(),
+      });
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: cpfpRefundTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "cpfp",
+      parentTxOut: newNodeTx.getOutput(0),
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    if (!directFromCpfpRefundTx) {
+      throw new Error("Could not create direct refund transactions");
+    }
+
+    signingJobs.push({
+      signingPublicKey,
+      rawTx: directFromCpfpRefundTx.toBytes(),
+      signingNonceCommitment:
+        await this.config.signer.getRandomSigningCommitment(),
+      type: "directFromCpfp",
+      parentTxOut: newNodeTx.getOutput(0),
+      leafId: node.id,
+      keyDerivation,
+      verifyingKey: node.verifyingPublicKey,
+    });
+
+    return signingJobs;
+  }
+
+  async claimTransfer(transfer: Transfer): Promise<TreeNode[]> {
+    const assertClaimNotDestroyed = () =>
+      this.assertNotDestroyed(
+        "Claim transfer process was interrupted due to cleanup",
+      );
+
+    const onError = async (
+      context: RetryContext<TreeNode[], Transfer>,
+    ): Promise<TreeNode[] | undefined> => {
+      assertClaimNotDestroyed();
+
+      const error = context.error;
+      if (
+        error instanceof SparkRequestError &&
+        error.originalError instanceof ClientError &&
+        error.originalError.code === Status.ALREADY_EXISTS
+      ) {
+        const transferToUse = context.data || transfer;
+        const updatedTransfer = await this.queryTransfer(transferToUse.id);
+
+        if (
+          !updatedTransfer ||
+          updatedTransfer.status !== TransferStatus.TRANSFER_STATUS_COMPLETED
+        ) {
+          return undefined;
+        }
+
+        const leaves = updatedTransfer.leaves.flatMap((leaf) =>
+          leaf.leaf ? [leaf.leaf] : [],
+        );
+
+        return leaves;
+      }
+      return;
+    };
+
+    const fetchData = async (context: RetryContext<TreeNode[], Transfer>) => {
+      assertClaimNotDestroyed();
+
+      const transferToUse = context.data || transfer;
+      const updatedTransfer = await this.queryPendingTransfers({
+        transferIds: [transferToUse.id],
+      });
+      if (!updatedTransfer.transfers[0]) {
+        return undefined;
+      }
+      return updatedTransfer.transfers[0];
+    };
+
+    try {
+      const result = await withRetry(
+        async (updatedTransfer?: Transfer) => {
+          assertClaimNotDestroyed();
+          const transferToUse = updatedTransfer ?? transfer;
+          return await this.claimTransferCore(transferToUse);
+        },
+        {
+          callbacks: {
+            onStart: assertClaimNotDestroyed,
+            onError,
+            fetchData,
+          },
+        },
+      );
+
+      if (result.length === 0) {
+        return [];
+      }
+
+      return result;
+    } catch (error) {
+      this.logger.warn(
+        `Failed to claim transfer after all retries. Please try reinitializing your wallet in a few minutes. Transfer ID: ${transfer.id}. Error: ${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+
+      throw new SparkError("Failed to claim transfer", { error });
+    }
+  }
+}
+
+function formatUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  if (typeof error === "string") {
+    return error;
+  }
+  if (typeof error === "number" || typeof error === "boolean") {
+    return String(error);
+  }
+  return "unknown error";
+}

@@ -1,0 +1,683 @@
+import Foundation
+import React
+
+@objc(SparkFrostModule)
+class SparkFrostModule: NSObject, RCTBridgeModule {
+    
+    @objc
+    static func moduleName() -> String! {
+        return "SparkFrostModule"
+    }
+    
+    @objc
+    static func requiresMainQueueSetup() -> Bool {
+        return false
+    }
+    
+    private func arrayToData(_ array: [Any]) -> Data? {
+        return (array as? [Int])?.map { UInt8($0) }.data
+    }
+    
+    private func dataToArray(_ data: Data) -> [Int] {
+        return Array(data).map { Int($0) }
+    }
+    
+    @objc(signFrost:resolve:reject:)
+    func rn_SignFrost(_ params: [String: Any],
+                   resolve: @escaping RCTPromiseResolveBlock,
+                   reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let msgArray = params["msg"] as? [Any],
+                  let msg = arrayToData(msgArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid msg format"])
+            }
+            
+            guard let keyPackageDict = params["keyPackage"] as? [String: Any],
+                  let secretKeyArray = keyPackageDict["secretKey"] as? [Any],
+                  let publicKeyArray = keyPackageDict["publicKey"] as? [Any],
+                  let verifyingKeyArray = keyPackageDict["verifyingKey"] as? [Any],
+                  let secretKey = arrayToData(secretKeyArray),
+                  let publicKey = arrayToData(publicKeyArray),
+                  let verifyingKey = arrayToData(verifyingKeyArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid keyPackage format"])
+            }
+            
+            let keyPackage = KeyPackage(
+                secretKey: secretKey,
+                publicKey: publicKey,
+                verifyingKey: verifyingKey
+            )
+            
+            guard let nonceDict = params["nonce"] as? [String: Any],
+                  let hidingArray = nonceDict["hiding"] as? [Any],
+                  let bindingArray = nonceDict["binding"] as? [Any],
+                  let hiding = arrayToData(hidingArray),
+                  let binding = arrayToData(bindingArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid nonce format"])
+            }
+            
+            let nonce = SigningNonce(
+                hiding: hiding,
+                binding: binding
+            )
+            
+            guard let commitmentDict = params["selfCommitment"] as? [String: Any],
+                  let commitHidingArray = commitmentDict["hiding"] as? [Any],
+                  let commitBindingArray = commitmentDict["binding"] as? [Any],
+                  let commitHiding = arrayToData(commitHidingArray),
+                  let commitBinding = arrayToData(commitBindingArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid selfCommitment format"])
+            }
+            
+            let selfCommitment = SigningCommitment(
+                hiding: commitHiding,
+                binding: commitBinding
+            )
+            
+            guard let statechainCommitmentsDict = params["statechainCommitments"] as? [String: Any] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid statechainCommitments format"])
+            }
+            
+            var statechainCommitments: [String: SigningCommitment] = [:]
+            
+            for (key, value) in statechainCommitmentsDict {
+                guard let commitDict = value as? [String: Any],
+                      let hidingArray = commitDict["hiding"] as? [Any],
+                      let bindingArray = commitDict["binding"] as? [Any],
+                      let hiding = arrayToData(hidingArray),
+                      let binding = arrayToData(bindingArray) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid statechain commitment format"])
+                }
+                
+                statechainCommitments[key] = SigningCommitment(
+                    hiding: hiding,
+                    binding: binding
+                )
+            }
+            
+            let adaptorPubKey: Data?
+            if let adaptorArray = params["adaptorPubKey"] as? [Any] {
+                adaptorPubKey = arrayToData(adaptorArray)
+            } else {
+                adaptorPubKey = nil
+            }
+            
+            let result = try signFrost(
+                msg: msg,
+                keyPackage: keyPackage,
+                nonce: nonce,
+                selfCommitment: selfCommitment,
+                statechainCommitments: statechainCommitments,
+                adaptorPublicKey: adaptorPubKey
+            )
+            
+            resolve(dataToArray(result))
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+    
+    @objc(aggregateFrost:resolve:reject:)
+    func rn_AggregateFrost(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let msgArray = params["msg"] as? [Any],
+                  let msg = arrayToData(msgArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid msg format"])
+            }
+            
+            // Parse statechain commitments
+            guard let statechainCommitmentsDict = params["statechainCommitments"] as? [String: Any] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid statechainCommitments format"])
+            }
+            
+            var statechainCommitments: [String: SigningCommitment] = [:]
+            for (key, value) in statechainCommitmentsDict {
+                guard let commitDict = value as? [String: Any],
+                      let hidingArray = commitDict["hiding"] as? [Any],
+                      let bindingArray = commitDict["binding"] as? [Any],
+                      let hiding = arrayToData(hidingArray),
+                      let binding = arrayToData(bindingArray) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid statechain commitment format"])
+                }
+                statechainCommitments[key] = SigningCommitment(hiding: hiding, binding: binding)
+            }
+            
+            // Parse self commitment
+            guard let selfCommitmentDict = params["selfCommitment"] as? [String: Any],
+                  let selfHidingArray = selfCommitmentDict["hiding"] as? [Any],
+                  let selfBindingArray = selfCommitmentDict["binding"] as? [Any],
+                  let selfHiding = arrayToData(selfHidingArray),
+                  let selfBinding = arrayToData(selfBindingArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid selfCommitment format"])
+            }
+            let selfCommitment = SigningCommitment(hiding: selfHiding, binding: selfBinding)
+            
+            // Parse statechain signatures
+            guard let statechainSignaturesDict = params["statechainSignatures"] as? [String: Any] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid statechainSignatures format"])
+            }
+            
+            var statechainSignatures: [String: Data] = [:]
+            for (key, value) in statechainSignaturesDict {
+                guard let sigArray = value as? [Any],
+                      let signature = arrayToData(sigArray) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid signature format"])
+                }
+                statechainSignatures[key] = signature
+            }
+            
+            guard let statechainPublicKeysDict = params["statechainPublicKeys"] as? [String: Any] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid statechainPublicKeys format"])
+            }
+            var statechainPublicKeys: [String: Data] = [:]
+            for (key, value) in statechainPublicKeysDict {
+                guard let keyArray = value as? [Any],
+                    let keyData = arrayToData(keyArray) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid statechain public key format"])
+                }
+                statechainPublicKeys[key] = keyData
+            }
+
+            // Parse remaining parameters
+            guard let selfSignatureArray = params["selfSignature"] as? [Any],
+                  let selfSignature = arrayToData(selfSignatureArray),
+                  let selfPublicKeyArray = params["selfPublicKey"] as? [Any],
+                  let selfPublicKey = arrayToData(selfPublicKeyArray),
+                  let verifyingKeyArray = params["verifyingKey"] as? [Any],
+                  let verifyingKey = arrayToData(verifyingKeyArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid parameter format"])
+            }
+            
+            let adaptorPubKey: Data?
+            if let adaptorArray = params["adaptorPubKey"] as? [Any] {
+                adaptorPubKey = arrayToData(adaptorArray)
+            } else {
+                adaptorPubKey = nil
+            }
+            
+            let result = try aggregateFrost(
+                msg: msg,
+                statechainCommitments: statechainCommitments,
+                selfCommitment: selfCommitment,
+                statechainSignatures: statechainSignatures,
+                selfSignature: selfSignature,
+                statechainPublicKeys: statechainPublicKeys,
+                selfPublicKey: selfPublicKey,
+                verifyingKey: verifyingKey,
+                adaptorPublicKey: adaptorPubKey
+            )
+            
+            resolve(dataToArray(result))
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+    
+    @objc(createDummyTx:resolve:reject:)
+    func rn_createDummyTx(_ params: NSDictionary,
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        print("SparkFrostModule.swift: createDummyTx called with params: \(params)")
+        do {
+            guard let address = params["address"] as? String else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Address is required"])
+            }
+            
+            guard let amountSatsStr = params["amountSats"] as? String,
+                  let amountSats = UInt64(amountSatsStr) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid amountSats format"])
+            }
+            
+            // Call the UniFFI-generated function
+            let result = try createDummyTx(address: address, amountSats: amountSats)
+            
+            // Convert the result to a format that can be passed to JavaScript
+            let resultDict: [String: Any] = [
+                "tx": dataToArray(result.tx),
+                "txid": result.txid
+            ]
+            
+            print("SparkFrostModule.swift: About to resolve with: \(resultDict)")
+            resolve(resultDict)
+            print("SparkFrostModule.swift: Swift resolve was called.")
+        } catch {
+            print("SparkFrostModule.swift: Error in createDummyTx: \(error.localizedDescription)")
+            reject("ERROR_CREATE_DUMMY_TX", error.localizedDescription, error)
+        }
+    }
+    
+    @objc(encryptEcies:resolve:reject:)
+    func rn_encryptEcies(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        print("SparkFrostModule.swift: encryptEcies called with params: \(params)")
+        do {
+            guard let msgArray = params["msg"] as? [Any],
+                  let msgData = arrayToData(msgArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid msg format for encryptEcies"])
+            }
+
+            guard let publicKeyArray = params["publicKey"] as? [Any],
+                  let publicKeyData = arrayToData(publicKeyArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid publicKey format for encryptEcies"])
+            }
+
+            // Call the UniFFI-generated global function
+            let resultData = try encryptEcies(msg: msgData, publicKey: publicKeyData)
+            
+            print("SparkFrostModule.swift: encryptEcies about to resolve")
+            resolve(dataToArray(resultData)) // Convert result Data to [Int] for JS
+            print("SparkFrostModule.swift: encryptEcies resolve was called.")
+        } catch {
+            print("SparkFrostModule.swift: Error in encryptEcies: \(error.localizedDescription)")
+            reject("ERROR_ENCRYPT_ECIES", error.localizedDescription, error)
+        }
+    }
+
+    @objc(decryptEcies:resolve:reject:)
+    func rn_decryptEcies(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        print("SparkFrostModule.swift: decryptEcies called with params: \(params)")
+        do {
+            guard let encryptedMsgArray = params["encryptedMsg"] as? [Any],
+                  let encryptedMsgData = arrayToData(encryptedMsgArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid encryptedMsg format for decryptEcies"])
+            }
+
+            guard let privateKeyArray = params["privateKey"] as? [Any],
+                  let privateKeyData = arrayToData(privateKeyArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid privateKey format for decryptEcies"])
+            }
+
+            // Call the UniFFI-generated global function
+            let resultData = try decryptEcies(encryptedMsg: encryptedMsgData, privateKey: privateKeyData)
+            
+            print("SparkFrostModule.swift: decryptEcies about to resolve")
+            resolve(dataToArray(resultData)) // Convert result Data to [Int] for JS
+            print("SparkFrostModule.swift: decryptEcies resolve was called.")
+        } catch {
+            print("SparkFrostModule.swift: Error in decryptEcies: \(error.localizedDescription)")
+            reject("ERROR_DECRYPT_ECIES", error.localizedDescription, error)
+        }
+    }
+
+    @objc(verifySignature:resolve:reject:)
+    func rn_verifySignature(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        print("SparkFrostModule.swift: verifySignature called with params: \(params)")
+        do {
+            guard let signatureArray = params["signature"] as? [Any],
+                  let signature = arrayToData(signatureArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid signature format for verifySignature"])
+            }
+            guard let messageArray = params["message"] as? [Any],
+                  let message = arrayToData(messageArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid message format for verifySignature"])
+            }
+            guard let publicKeyArray = params["publicKey"] as? [Any],
+                  let publicKey = arrayToData(publicKeyArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid publicKey format for verifySignature"])
+            }
+
+            let result = try verifySignatureBytes(signature: signature, message: message, pubkey: publicKey)
+
+            print("SparkFrostModule.swift: verifySignature about to resolve")
+            resolve(result)
+            print("SparkFrostModule.swift: verifySignature resolve was called.")
+        } catch {
+            print("SparkFrostModule.swift: Error in verifySignature: \(error.localizedDescription)")
+            reject("ERROR_VERIFY_SIGNATURE", error.localizedDescription, error)
+        }
+    }
+
+    @objc(getPublicKey:resolve:reject:)
+    func rn_getPublicKey(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        print("SparkFrostModule.swift: getPublicKey called with params: \(params)")
+        do {
+            guard let privateKeyArray = params["privateKey"] as? [Any],
+                  let privateKey = arrayToData(privateKeyArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid privateKey format for getPublicKey"])
+            }
+            guard let compressed = params["compressed"] as? Bool else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid compressed format for getPublicKey"])
+            }
+
+            let result = try getPublicKeyBytes(privateKeyBytes: privateKey, compressed: compressed)
+
+            print("SparkFrostModule.swift: getPublicKey about to resolve")
+            resolve(dataToArray(result))
+            print("SparkFrostModule.swift: getPublicKey resolve was called.")
+        } catch {
+            print("SparkFrostModule.swift: Error in getPublicKey: \(error.localizedDescription)")
+            reject("ERROR_GET_PUBLIC_KEY", error.localizedDescription, error)
+        }
+    }
+
+    @objc(batchGetPublicKeys:resolve:reject:)
+    func rn_batchGetPublicKeys(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        print("SparkFrostModule.swift: batchGetPublicKeys called with params: \(params)")
+        do {
+            guard let privateKeysArray = params["privateKeys"] as? [[Any]] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid privateKeys format for batchGetPublicKeys; expected an array of byte arrays"])
+            }
+            guard let compressed = params["compressed"] as? Bool else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid compressed format for batchGetPublicKeys"])
+            }
+
+            var results: [[Int]] = []
+            results.reserveCapacity(privateKeysArray.count)
+
+            for (idx, keyBytesAny) in privateKeysArray.enumerated() {
+                guard let keyData = arrayToData(keyBytesAny) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid privateKey at index \(idx); expected a byte array"])
+                }
+                let pubKey = try getPublicKeyBytes(privateKeyBytes: keyData, compressed: compressed)
+                results.append(dataToArray(pubKey))
+            }
+
+            print("SparkFrostModule.swift: batchGetPublicKeys about to resolve")
+            resolve(results)
+            print("SparkFrostModule.swift: batchGetPublicKeys resolve was called.")
+        } catch {
+            print("SparkFrostModule.swift: Error in batchGetPublicKeys: \(error.localizedDescription)")
+            reject("ERROR_BATCH_GET_PUBLIC_KEYS", error.localizedDescription, error)
+        }
+    }
+
+    @objc(getRandomPrivateKey:reject:)
+    func rn_getRandomPrivateKey(_ resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        print("SparkFrostModule.swift: getRandomPrivateKey called")
+        do {
+            let result = try randomSecretKeyBytes()
+            print("SparkFrostModule.swift: getRandomPrivateKey about to resolve")
+            resolve(dataToArray(result))
+            print("SparkFrostModule.swift: getRandomPrivateKey resolve was called.")
+        } catch {
+            print("SparkFrostModule.swift: Error in getRandomPrivateKey: \(error.localizedDescription)")
+            reject("ERROR_GET_RANDOM_PRIVATE_KEY", error.localizedDescription, error)
+        }
+    }
+
+    @objc(splitSecretWithProofs:resolve:reject:)
+    func rn_splitSecretWithProofs(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let secretArray = params["secret"] as? [Any],
+                  let secret = arrayToData(secretArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid secret format"])
+            }
+            guard let threshold = params["threshold"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid threshold format"])
+            }
+            guard let numShares = params["numShares"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid numShares format"])
+            }
+
+            let result = try splitSecretWithProofsUniffi(
+                secret: secret,
+                threshold: UInt32(threshold),
+                numShares: UInt32(numShares)
+            )
+
+            let sharesArray: [[String: Any]] = result.map { share in
+                let proofsArray: [[Int]] = share.proofs.map { dataToArray($0) }
+                return [
+                    "threshold": Int(share.threshold),
+                    "index": Int(share.index),
+                    "share": dataToArray(share.share),
+                    "proofs": proofsArray
+                ]
+            }
+
+            resolve(sharesArray)
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+
+    @objc(recoverSecret:resolve:reject:)
+    func rn_recoverSecret(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let sharesArray = params["shares"] as? [[String: Any]] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid shares format"])
+            }
+
+            let shares: [SecretShareResult] = try sharesArray.enumerated().map { (i, shareDict) in
+                guard let threshold = shareDict["threshold"] as? Int else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid threshold at index \(i)"])
+                }
+                guard let index = shareDict["index"] as? Int else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid index at index \(i)"])
+                }
+                guard let shareArr = shareDict["share"] as? [Any],
+                      let shareData = arrayToData(shareArr) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid share bytes at index \(i)"])
+                }
+                return SecretShareResult(
+                    threshold: UInt32(threshold),
+                    index: UInt32(index),
+                    share: shareData
+                )
+            }
+
+            let result = try recoverSecretUniffi(shares: shares)
+            resolve(dataToArray(result))
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+
+    @objc(validateShare:resolve:reject:)
+    func rn_validateShare(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let shareArr = params["share"] as? [Any],
+                  let share = arrayToData(shareArr) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid share format"])
+            }
+            guard let index = params["index"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid index format"])
+            }
+            guard let threshold = params["threshold"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid threshold format"])
+            }
+            guard let proofsArray = params["proofs"] as? [[Any]] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid proofs format"])
+            }
+
+            let proofs: [Data] = try proofsArray.enumerated().map { (i, proofArr) in
+                guard let proofData = arrayToData(proofArr) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid proof at index \(i)"])
+                }
+                return proofData
+            }
+
+            try validateShareUniffi(
+                share: share,
+                index: UInt32(index),
+                threshold: UInt32(threshold),
+                proofs: proofs
+            )
+
+            resolve(nil)
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+
+    @objc(constructNodeTxPair:resolve:reject:)
+    func rn_constructNodeTxPair(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let parentTxArray = params["parentTx"] as? [Any],
+                  let parentTx = arrayToData(parentTxArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid parentTx format"])
+            }
+            guard let vout = params["vout"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid vout format"])
+            }
+            guard let address = params["address"] as? String else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid address format"])
+            }
+            guard let sequence = params["sequence"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid sequence format"])
+            }
+            guard let directSequence = params["directSequence"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid directSequence format"])
+            }
+            guard let feeSatsStr = params["feeSats"] as? String,
+                  let feeSats = UInt64(feeSatsStr) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid feeSats format"])
+            }
+
+            let result = try constructNodeTxPair(
+                parentTx: parentTx,
+                vout: UInt32(vout),
+                address: address,
+                sequence: UInt32(sequence),
+                directSequence: UInt32(directSequence),
+                feeSats: feeSats
+            )
+
+            let resultDict: [String: Any] = [
+                "cpfp": ["tx": dataToArray(result.cpfp.tx)],
+                "direct": ["tx": dataToArray(result.direct.tx)]
+            ]
+            resolve(resultDict)
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+
+    @objc(constructRefundTxTrio:resolve:reject:)
+    func rn_constructRefundTxTrio(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let cpfpNodeTxArray = params["cpfpNodeTx"] as? [Any],
+                  let cpfpNodeTx = arrayToData(cpfpNodeTxArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid cpfpNodeTx format"])
+            }
+
+            var directNodeTx: Data? = nil
+            if let directNodeTxArray = params["directNodeTx"] as? [Any] {
+                directNodeTx = arrayToData(directNodeTxArray)
+            }
+
+            guard let vout = params["vout"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid vout format"])
+            }
+            guard let receivingPubkeyArray = params["receivingPubkey"] as? [Any],
+                  let receivingPubkey = arrayToData(receivingPubkeyArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid receivingPubkey format"])
+            }
+            guard let network = params["network"] as? String else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid network format"])
+            }
+            guard let sequence = params["sequence"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid sequence format"])
+            }
+            guard let directSequence = params["directSequence"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid directSequence format"])
+            }
+            guard let feeSatsStr = params["feeSats"] as? String,
+                  let feeSats = UInt64(feeSatsStr) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid feeSats format"])
+            }
+
+            let result = try constructRefundTxTrio(
+                cpfpNodeTx: cpfpNodeTx,
+                directNodeTx: directNodeTx,
+                vout: UInt32(vout),
+                receivingPubkey: receivingPubkey,
+                network: network,
+                sequence: UInt32(sequence),
+                directSequence: UInt32(directSequence),
+                feeSats: feeSats
+            )
+
+            var resultDict: [String: Any] = [
+                "cpfp_refund": ["tx": dataToArray(result.cpfpRefund.tx)],
+                "direct_from_cpfp_refund": ["tx": dataToArray(result.directFromCpfpRefund.tx)]
+            ]
+
+            if let directRefund = result.directRefund {
+                resultDict["direct_refund"] = ["tx": dataToArray(directRefund.tx)]
+            }
+
+            resolve(resultDict)
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+
+    @objc(computeMultiInputSighash:resolve:reject:)
+    func rn_computeMultiInputSighash(_ params: [String: Any],
+                       resolve: @escaping RCTPromiseResolveBlock,
+                       reject: @escaping RCTPromiseRejectBlock) {
+        do {
+            guard let txArray = params["tx"] as? [Any],
+                  let tx = arrayToData(txArray) else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid tx format"])
+            }
+            guard let inputIndex = params["inputIndex"] as? Int else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid inputIndex format"])
+            }
+            guard let prevOutScriptsArrays = params["prevOutScripts"] as? [[Any]] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid prevOutScripts format"])
+            }
+            guard let prevOutValuesArray = params["prevOutValues"] as? [Any] else {
+                throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid prevOutValues format"])
+            }
+
+            let prevOutScripts: [Data] = try prevOutScriptsArrays.enumerated().map { (i, arr) in
+                guard let data = arrayToData(arr) else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid prevOutScript at index \(i)"])
+                }
+                return data
+            }
+
+            let prevOutValues: [UInt64] = try prevOutValuesArray.enumerated().map { (i, val) in
+                guard let num = val as? NSNumber else {
+                    throw NSError(domain: "", code: -1, userInfo: [NSLocalizedDescriptionKey: "Invalid prevOutValue at index \(i)"])
+                }
+                return num.uint64Value
+            }
+
+            let result = try computeMultiInputSighashUniffi(
+                tx: tx,
+                inputIndex: UInt32(inputIndex),
+                prevOutScripts: prevOutScripts,
+                prevOutValues: prevOutValues
+            )
+
+            resolve(dataToArray(result))
+        } catch {
+            reject("ERROR", error.localizedDescription, error)
+        }
+    }
+
+    func constantsToExport() -> [AnyHashable : Any]! {
+        return [:]
+    }
+}
+
+private extension Array where Element == UInt8 {
+    var data: Data {
+        return Data(self)
+    }
+}

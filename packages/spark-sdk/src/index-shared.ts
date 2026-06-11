@@ -1,0 +1,55 @@
+export * from "./errors/index.js";
+export * from "./utils/index.js";
+
+export { getSparkFrost } from "./spark-bindings/spark-bindings.js";
+
+export {
+  DefaultSparkSigner,
+  UnsafeStatelessSparkSigner,
+  type SparkSigner,
+} from "./signer/signer.js";
+export {
+  ThresholdSparkSigner,
+  type ThresholdSparkSignerOptions,
+} from "./signer/threshold-signer.js";
+export {
+  type SigningCommitmentWithOptionalNonce,
+  type SigningNonce,
+  type SigningCommitment,
+  KeyDerivationType,
+  type KeyDerivation,
+  type SignFrostParams,
+  type AggregateFrostParams,
+  type SplitSecretWithProofsParams,
+  type DerivedHDKey,
+  type KeyPair,
+  type SubtractSplitAndEncryptParams,
+  type SubtractSplitAndEncryptResult,
+} from "./signer/types.js";
+
+export { type IKeyPackage, type DummyTx } from "./spark-bindings/types.js";
+export * from "./spark-readonly-client/types.js";
+export * from "./spark-wallet/types.js";
+
+export { type WalletConfigService } from "./services/config.js";
+export { CoopExitService } from "./services/coop-exit.js";
+export { default as LeafManager } from "./services/leaf-manager.js";
+export { SigningService } from "./services/signing.js";
+export { default as SwapService } from "./services/swap.js";
+export { TokenTransactionService } from "./services/tokens/token-transactions.js";
+export { type LeafKeyTweak, TransferService } from "./services/transfer.js";
+export {
+  WalletConfig,
+  createLocalSigningOperators,
+  getElectrsUrl,
+  getLocalSigningOperators,
+  getLocalSigningThreshold,
+  getSspIdentityPublicKey,
+  getSspSchemaEndpoint,
+  mergeConfigOptionsForNetwork,
+  normalizeNetworkType,
+  rewriteSigningOperatorAddresses,
+  type ConfigOptions,
+  type SigningOperator,
+  type TlsOptions,
+} from "./services/wallet-config.js";

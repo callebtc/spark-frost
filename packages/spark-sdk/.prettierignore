@@ -1,0 +1,8 @@
+dist/
+
+# Ignore generated files
+wasm/
+src/proto/
+src/wasm/
+src/graphql/objects/
+src/examples/example.js
