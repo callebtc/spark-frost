@@ -13,6 +13,8 @@ dist/
 !.yarn/releases/**
 !.yarn/plugins/
 !.yarn/plugins/**
+__pycache__/
+*.py[cod]
 
 # Local wallet/demo state
 private/

@@ -15,6 +15,13 @@ contains demo host secrets and participant secret shares.
 yarn dkg:keygen
 ```
 
+The Blockstream reference requires Python `>=3.11`. If your default `python3` is
+older, run:
+
+```sh
+PYTHON=/path/to/python3.11 yarn dkg:keygen
+```
+
 This writes `dkg/state/chilldkg-2of3.json` with:
 
 - the threshold public key
@@ -32,9 +39,42 @@ yarn dkg:spark-smoke
 ```
 
 The smoke test reads the ChillDKG artifact, builds a local Spark-compatible
-threshold signer from the participant shares, verifies an aggregated Spark
-FROST signature against the DKG threshold public key, and initializes a REGTEST
-Spark wallet using that DKG-backed leaf signer.
+threshold signer from the participant shares, confirms the generated Spark
+FROST signature share matches Spark's direct signing path for the same
+threshold public key, and initializes a REGTEST Spark wallet using that
+DKG-backed leaf signer.
+
+To skip the REGTEST wallet initialization and only check signature-share
+compatibility:
+
+```sh
+SKIP_SPARK_WALLET=1 yarn dkg:spark-smoke
+```
+
+## REGTEST Pipeline
+
+Run:
+
+```sh
+NETWORK=REGTEST yarn dkg:pipeline
+```
+
+The first run creates:
+
+- a Spark wallet whose leaf key is the ChillDKG threshold public key
+- a normal Spark receiver wallet
+- a single-use `bcrt1...` Bitcoin deposit address
+- a local state file at `dkg/state/regtest-dkg-demo.json`
+
+Fund the printed `bcrt1...` address at the Lightspark REGTEST faucet, then
+resume:
+
+```sh
+NETWORK=REGTEST FAUCET_TXID="<faucet-txid>" yarn dkg:pipeline
+```
+
+The resumed run claims the deposit, sends a Spark transfer to the normal wallet,
+creates a Lightning invoice, and pays it from the DKG-backed wallet.
 
 This is still a local demo: secret shares are loaded into one process for the
 smoke test. A production version would keep each share on its own signer device
