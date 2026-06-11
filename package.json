@@ -14,7 +14,7 @@
   },
   "scripts": {
     "build": "yarn workspace @buildonspark/spark-sdk build",
-    "types": "yarn workspace @buildonspark/spark-sdk types && yarn workspace @buildonspark/nodejs-scripts types && yarn workspace spark-frost-demo types",
+    "types": "yarn workspace @buildonspark/spark-sdk types && yarn workspace @buildonspark/nodejs-scripts types && yarn workspace spark-frost-demo types && yarn workspace spark-frost-dkg types",
     "test": "yarn workspace @buildonspark/spark-sdk test-cmd src/tests/threshold-signer.test.ts",
     "demo:create-wallet": "yarn workspace spark-frost-demo create-wallet",
     "demo:normal-wallet": "yarn workspace spark-frost-demo normal-wallet",
@@ -23,10 +23,14 @@
     "demo:pay-invoice": "yarn workspace spark-frost-demo pay-invoice",
     "demo:lightning": "yarn workspace spark-frost-demo lightning",
     "demo:pipeline": "yarn workspace spark-frost-demo pipeline",
+    "dkg:keygen": "yarn workspace spark-frost-dkg keygen",
+    "dkg:spark-smoke": "yarn workspace spark-frost-dkg spark-smoke",
+    "dkg:pipeline": "yarn workspace spark-frost-dkg pipeline",
     "wallet:address": "yarn workspace @buildonspark/nodejs-scripts get-spark-address",
     "wallet:balance": "yarn workspace @buildonspark/nodejs-scripts get-balance"
   },
   "workspaces": [
+    "dkg",
     "demo",
     "examples/*",
     "packages/*"

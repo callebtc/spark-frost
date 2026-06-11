@@ -17,6 +17,7 @@ dist/
 # Local wallet/demo state
 private/
 demo/state/
+dkg/state/
 *.log
 
 # Local upstream checkout used while extracting this fork.
